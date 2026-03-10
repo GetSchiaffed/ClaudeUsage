@@ -2,6 +2,18 @@
 
 A lightweight macOS menu bar app that monitors your [Claude Code](https://claude.ai/code) usage in real time — showing token counts, API-equivalent cost estimates, and plan utilization windows without leaving your workflow.
 
+## Quick Start
+
+```bash
+git clone https://github.com/GetSchiaffed/ClaudeUsage.git
+cd ClaudeUsage
+chmod +x build.sh
+./build.sh
+open ClaudeUsage.app
+```
+
+> Requires macOS 12+ and Xcode Command Line Tools (`xcode-select --install`)
+
 ---
 
 ## Features
