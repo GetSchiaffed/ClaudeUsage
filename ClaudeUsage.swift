@@ -559,12 +559,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     private var currentEmail = "default"
     private var costField: NSTextField!
+    private var renewalDayField: NSTextField!
     private var loginItemCheckbox: NSButton!
     private var onSave: (() -> Void)?
 
     init(onSave: @escaping () -> Void) {
         self.onSave = onSave
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 180),
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 215),
                             styleMask: [.titled, .closable, .nonactivatingPanel],
                             backing: .buffered, defer: false)
         panel.title = "Claude Usage Settings"
@@ -578,6 +579,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         currentEmail = email
         let s = UserDefaults.standard.double(forKey: "planCost_\(email)")
         costField?.stringValue = s > 0 ? String(format: "%.2f", s) : "20.00"
+        let rd = UserDefaults.standard.integer(forKey: "billingDay_\(email)")
+        renewalDayField?.stringValue = rd > 0 ? "\(rd)" : "1"
         loginItemCheckbox?.state = loadLaunchAtLogin() ? .on : .off
     }
 
@@ -588,14 +591,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     private func buildUI() {
         guard let v = window?.contentView else { return }
-        let lbl = NSTextField(labelWithString: "Monthly plan cost (USD):")
-        lbl.frame = NSRect(x: 20, y: 120, width: 180, height: 20); v.addSubview(lbl)
-        costField = NSTextField(frame: NSRect(x: 205, y: 117, width: 80, height: 24))
+        let lbl1 = NSTextField(labelWithString: "Monthly plan cost (USD):")
+        lbl1.frame = NSRect(x: 20, y: 155, width: 180, height: 20); v.addSubview(lbl1)
+        costField = NSTextField(frame: NSRect(x: 205, y: 152, width: 80, height: 24))
         costField.placeholderString = "20.00"; costField.stringValue = "20.00"
         costField.delegate = self; v.addSubview(costField)
+        let lbl2 = NSTextField(labelWithString: "Billing renewal day (1–31):")
+        lbl2.frame = NSRect(x: 20, y: 115, width: 180, height: 20); v.addSubview(lbl2)
+        renewalDayField = NSTextField(frame: NSRect(x: 205, y: 112, width: 80, height: 24))
+        renewalDayField.placeholderString = "1"; renewalDayField.stringValue = "1"
+        renewalDayField.delegate = self; v.addSubview(renewalDayField)
         loginItemCheckbox = NSButton(checkboxWithTitle: "Launch at login",
                                      target: self, action: #selector(launchAtLoginToggled))
-        loginItemCheckbox.frame = NSRect(x: 20, y: 80, width: 200, height: 20)
+        loginItemCheckbox.frame = NSRect(x: 20, y: 78, width: 200, height: 20)
         loginItemCheckbox.state = loadLaunchAtLogin() ? .on : .off; v.addSubview(loginItemCheckbox)
         let note = NSTextField(labelWithString: "Costs shown are API-equivalent estimates.")
         note.frame = NSRect(x: 20, y: 50, width: 280, height: 20)
@@ -612,6 +620,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     @objc private func saveAction() {
         let val = Double(costField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 20.0
         UserDefaults.standard.set(max(0, val), forKey: "planCost_\(currentEmail)")
+        let rd = min(max(Int(renewalDayField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 1, 1), 31)
+        UserDefaults.standard.set(rd, forKey: "billingDay_\(currentEmail)")
         window?.orderOut(nil); onSave?()
     }
     @objc private func cancelAction() { window?.orderOut(nil) }
@@ -671,8 +681,8 @@ final class StatusBarController {
     init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
-            btn.title = "$--.--"
-            btn.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+            btn.attributedTitle = NSAttributedString(string: "$--.--", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)])
         }
     }
 
@@ -709,7 +719,6 @@ final class StatusBarController {
         let menu = NSMenu()
         let now = Date()
         let todayRecs = parser.records(for: now, from: allRecords)
-        let monthRecs = parser.recordsForCurrentMonth(from: allRecords)
         let todayCost = todayRecs.reduce(0.0) { $0 + $1.cost }
         let todayIn   = todayRecs.reduce(0) { $0 + $1.usage.inputTokens + $1.usage.cacheReadTokens }
         let todayOut  = todayRecs.reduce(0) { $0 + $1.usage.outputTokens }
@@ -746,7 +755,7 @@ final class StatusBarController {
 
         // ── Plan ──────────────────────────────────────────────────────────────
         let email = currentAccount?.email ?? UserDefaults.standard.string(forKey: "lastKnownEmail") ?? "default"
-        let (pl1, pl2) = planLines(monthRecs, email: email)
+        let (pl1, pl2) = planLines(email: email)
         addBody(menu, pl1)
         addCaption(menu, pl2)
         menu.addItem(.separator())
@@ -872,14 +881,55 @@ final class StatusBarController {
         return "\(m)m"
     }
 
-    private func planLines(_ recs: [UsageRecord], email: String) -> (String, String) {
+    /// Returns the anchor date (renewal day) for a given year+month, clamping to the last
+    /// day of that month if the requested day doesn't exist (e.g. day=31 in April → April 30).
+    private func billingAnchor(day: Int, year: Int, month: Int, cal: Calendar) -> Date? {
+        var c = DateComponents(); c.year = year; c.month = month; c.day = 1
+        guard let first = cal.date(from: c),
+              let daysInMonth = cal.range(of: .day, in: .month, for: first)?.count else { return nil }
+        c.day = min(day, daysInMonth)
+        return cal.date(from: c)
+    }
+
+    private func billingPeriodStart(renewalDay: Int, now: Date) -> Date {
+        let cal = Calendar.current
+        let y = cal.component(.year, from: now)
+        let m = cal.component(.month, from: now)
+        guard let thisMonthAnchor = billingAnchor(day: renewalDay, year: y, month: m, cal: cal) else { return now }
+        if now >= thisMonthAnchor { return thisMonthAnchor }
+        // Anchor hasn't been reached yet this month — period started last month
+        let prevM = m == 1 ? 12 : m - 1
+        let prevY = m == 1 ? y - 1 : y
+        return billingAnchor(day: renewalDay, year: prevY, month: prevM, cal: cal) ?? now
+    }
+
+    private func planLines(email: String) -> (String, String) {
         let stored = UserDefaults.standard.double(forKey: "planCost_\(email)")
         let plan = stored > 0 ? stored : 20.0
+        let rdStored = UserDefaults.standard.integer(forKey: "billingDay_\(email)")
+        let renewalDay = rdStored > 0 ? rdStored : 1
+
         let cal = Calendar.current; let now = Date()
-        let day = cal.component(.day, from: now)
-        let days = cal.range(of: .day, in: .month, for: now)?.count ?? 30
-        let mtd = recs.reduce(0.0) { $0 + $1.cost }
-        let target = plan / Double(days); let avg = day > 0 ? mtd / Double(day) : 0.0
+        let periodStart = billingPeriodStart(renewalDay: renewalDay, now: now)
+        let psY = cal.component(.year, from: periodStart)
+        let psM = cal.component(.month, from: periodStart)
+        let nextM = psM == 12 ? 1 : psM + 1
+        let nextY = psM == 12 ? psY + 1 : psY
+        guard let periodEnd = billingAnchor(day: renewalDay, year: nextY, month: nextM, cal: cal) else {
+            return ("--", "--")
+        }
+
+        let periodRecs = allRecords.filter { $0.timestamp >= periodStart && $0.timestamp < periodEnd }
+        let mtd = periodRecs.reduce(0.0) { $0 + $1.cost }
+
+        // Days elapsed = start-of-today minus start-of-period + 1 (count today as day 1)
+        let daysElapsed = max(1, (cal.dateComponents([.day],
+            from: cal.startOfDay(for: periodStart),
+            to: cal.startOfDay(for: now)).day ?? 0) + 1)
+        let daysTotal = max(1, cal.dateComponents([.day], from: periodStart, to: periodEnd).day ?? 30)
+
+        let target = plan / Double(daysTotal)
+        let avg = mtd / Double(daysElapsed)
         let ratio = target > 0 ? avg / target : 0.0
         let status = ratio >= 0.8 ? "on pace" : ratio >= 0.4 ? "below target" : "well below target"
         return (
@@ -888,20 +938,115 @@ final class StatusBarController {
         )
     }
 
+    private func makePillImage(pct: Double, text: String) -> NSImage {
+        let width: CGFloat = 46, height: CGFloat = 16
+        let img = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
+            let r = rect.insetBy(dx: 0.75, dy: 0.75)
+            let corner = r.height / 2
+            let track = NSBezierPath(roundedRect: r, xRadius: corner, yRadius: corner)
+            NSColor.white.withAlphaComponent(0.15).setFill(); track.fill()
+            NSColor.white.withAlphaComponent(0.30).setStroke()
+            track.lineWidth = 0.75; track.stroke()
+            NSGraphicsContext.saveGraphicsState()
+            track.addClip()
+            let frac = CGFloat(min(max(pct / 100.0, 0), 1.0))
+            if frac > 0 {
+                let fillRect = NSRect(x: r.minX, y: r.minY, width: r.width * frac, height: r.height)
+                let col: NSColor = pct >= 80 ? .systemRed : pct >= 50 ? .systemOrange : .systemBlue
+                col.withAlphaComponent(0.90).setFill()
+                NSBezierPath(rect: fillRect).fill()
+            }
+            NSGraphicsContext.restoreGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.6)
+            shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+            shadow.shadowBlurRadius = 1.5
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .bold),
+                .foregroundColor: NSColor.white,
+                .shadow: shadow]
+            let s = NSAttributedString(string: text, attributes: attrs)
+            let sz = s.size()
+            s.draw(at: NSPoint(x: (width - sz.width) / 2, y: (height - sz.height) / 2 + 0.5))
+            return true
+        }
+        return img
+    }
+
+    private func makeContainerImage(fh: UsageAPIClient.Bucket, sd: UsageAPIClient.Bucket, now: Date) -> NSImage {
+        let fhT = fh.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--"
+        let sdT = sd.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--"
+
+        let textAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.white]
+        let dimAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.55)]
+
+        let fhTAS = NSAttributedString(string: fhT, attributes: textAttrs)
+        let sdTAS = NSAttributedString(string: sdT, attributes: textAttrs)
+        let dotAS = NSAttributedString(string: "·", attributes: dimAttrs)
+
+        let pillW: CGFloat = 46, pillH: CGFloat = 16
+        let padX: CGFloat = 9, gap: CGFloat = 5
+        let height: CGFloat = 22
+
+        let contentW = pillW + gap + fhTAS.size().width
+                     + gap + dotAS.size().width + gap
+                     + pillW + gap + sdTAS.size().width
+        let totalW = padX * 2 + contentW
+
+        // Pre-render pills before entering drawing block
+        let pill1 = makePillImage(pct: fh.utilization, text: "\(Int(fh.utilization))%")
+        let pill2 = makePillImage(pct: sd.utilization, text: "\(Int(sd.utilization))%")
+
+        let img = NSImage(size: NSSize(width: totalW, height: height), flipped: false) { rect in
+            // Dark rounded container background
+            let bg = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 11, yRadius: 11)
+            NSColor(calibratedWhite: 0.08, alpha: 0.82).setFill(); bg.fill()
+            NSColor.white.withAlphaComponent(0.14).setStroke(); bg.lineWidth = 0.75; bg.stroke()
+
+            let cy = height / 2
+            var x = padX
+
+            func drawText(_ s: NSAttributedString) {
+                let sz = s.size()
+                s.draw(at: NSPoint(x: x, y: cy - sz.height / 2 + 0.5))
+                x += sz.width + gap
+            }
+            func drawPill(_ p: NSImage) {
+                p.draw(in: NSRect(x: x, y: cy - pillH / 2, width: pillW, height: pillH))
+                x += pillW + gap
+            }
+
+            drawPill(pill1)
+            drawText(fhTAS)
+            drawText(dotAS)
+            drawPill(pill2)
+            let sz = sdTAS.size()
+            sdTAS.draw(at: NSPoint(x: x, y: cy - sz.height / 2 + 0.5))
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }
+
     private func updateTitle() {
         guard let btn = statusItem.button else { return }
         if !isLoading, let fh = liveUsage?.fiveHour, let sd = liveUsage?.sevenDay {
-            let now = Date()
-            let fhT = fh.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--"
-            let sdT = sd.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--"
-            btn.title = "\(Int(fh.utilization))% \(fhT)  \u{00B7}  \(Int(sd.utilization))% \(sdT)"
-        } else if isLoading {
-            btn.title = "$--.--"
+            btn.image = makeContainerImage(fh: fh, sd: sd, now: Date())
+            btn.imageScaling = .scaleNone
+            btn.imagePosition = .imageOnly
+            btn.title = ""
         } else {
-            let cost = parser.records(for: Date(), from: allRecords).reduce(0.0) { $0 + $1.cost }
-            btn.title = CostCalculator.formatCost(cost)
+            btn.image = nil
+            btn.imagePosition = .noImage
+            let text = isLoading ? "$--.--" : CostCalculator.formatCost(
+                parser.records(for: Date(), from: allRecords).reduce(0.0) { $0 + $1.cost })
+            btn.attributedTitle = NSAttributedString(string: text, attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)])
         }
-        btn.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
     }
 
     // MARK: - Item constructors
@@ -945,7 +1090,15 @@ final class StatusBarController {
         let email = currentAccount?.email ?? UserDefaults.standard.string(forKey: "lastKnownEmail") ?? "default"
         settingsWindowController?.configure(for: email); settingsWindowController?.showPanel()
     }
-    @objc func refreshAction() { statusItem.button?.title = "$--.--"; refresh() }
+    @objc func refreshAction() {
+        if let btn = statusItem.button {
+            btn.image = nil
+            btn.imagePosition = .noImage
+            btn.attributedTitle = NSAttributedString(string: "$--.--", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)])
+        }
+        refresh()
+    }
 }
 
 // MARK: - AppDelegate
