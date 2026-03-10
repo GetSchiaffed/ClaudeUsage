@@ -1,0 +1,28 @@
+# Compiled app bundle (built by build.sh — not committed to source control)
+ClaudeUsage.app/
+
+# Old compiled binaries
+ClaudeUsage_new
+ClaudeUsage_old
+
+# Swift build artifacts
+*.o
+*.d
+*.swp
+*.swm
+*.swx
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+
+# Logs (written when running as launch agent)
+*.log
+*.err
