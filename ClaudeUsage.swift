@@ -672,7 +672,7 @@ final class StatusBarController {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             btn.title = "$--.--"
-            btn.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            btn.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         }
     }
 
@@ -901,7 +901,7 @@ final class StatusBarController {
             let cost = parser.records(for: Date(), from: allRecords).reduce(0.0) { $0 + $1.cost }
             btn.title = CostCalculator.formatCost(cost)
         }
-        btn.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        btn.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
     }
 
     // MARK: - Item constructors
