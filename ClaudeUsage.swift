@@ -13,7 +13,7 @@ import Foundation
 // Reset times: ideally from Anthropic usage API:
 //   GET https://claude.ai/api/organizations/{orgId}/usage
 // Returns actual resetsAt timestamps + utilization%, same as Claude Code built-in panel.
-// Requires sessionKey cookie from Safari. Falls back to JSONL sliding-window estimate.
+// Requires sessionKey cookie from Safari, Chrome, Brave, or Arc. Falls back to JSONL sliding-window estimate.
 
 // MARK: - Data Structures
 
