@@ -256,6 +256,30 @@ final class AccountDetector {
     }
 }
 
+// MARK: - Browser Preference
+
+enum BrowserPreference: String, CaseIterable {
+    case auto   = "auto"
+    case safari = "safari"
+    case chrome = "chrome"
+    case brave  = "brave"
+    case arc    = "arc"
+
+    var displayName: String {
+        switch self {
+        case .auto:   return "Auto (try all)"
+        case .safari: return "Safari"
+        case .chrome: return "Chrome"
+        case .brave:  return "Brave"
+        case .arc:    return "Arc"
+        }
+    }
+
+    static var stored: BrowserPreference {
+        BrowserPreference(rawValue: UserDefaults.standard.string(forKey: "preferredBrowser") ?? "auto") ?? .auto
+    }
+}
+
 // MARK: - SessionCookieReader
 //
 // Reads the `sessionKey` cookie for claude.ai from Safari or Chromium-based browsers.
@@ -269,18 +293,25 @@ final class AccountDetector {
 //   - IV: 16 space characters (0x20)
 //   - Keychain service name differs per browser (e.g. "Chrome Safe Storage")
 //
-// Tries Safari first, then Chrome, then Brave, then Arc.
-// Returns nil gracefully if no supported browser has the cookie.
+// The browser to read from is controlled by the "preferredBrowser" UserDefaults key.
+// Default is "auto" which tries Safari → Chrome → Brave → Arc in order.
 
 final class SessionCookieReader {
 
     // MARK: Public entry point
 
     func readSessionKey() -> String? {
-        return readSafariSessionKey()
-            ?? readChromiumSessionKey(browser: .chrome)
-            ?? readChromiumSessionKey(browser: .brave)
-            ?? readChromiumSessionKey(browser: .arc)
+        switch BrowserPreference.stored {
+        case .auto:
+            return readSafariSessionKey()
+                ?? readChromiumSessionKey(browser: .chrome)
+                ?? readChromiumSessionKey(browser: .brave)
+                ?? readChromiumSessionKey(browser: .arc)
+        case .safari: return readSafariSessionKey()
+        case .chrome: return readChromiumSessionKey(browser: .chrome)
+        case .brave:  return readChromiumSessionKey(browser: .brave)
+        case .arc:    return readChromiumSessionKey(browser: .arc)
+        }
     }
 
     // MARK: Safari (binary cookies, plaintext)
@@ -561,11 +592,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var costField: NSTextField!
     private var renewalDayField: NSTextField!
     private var loginItemCheckbox: NSButton!
+    private var browserPopup: NSPopUpButton!
     private var onSave: (() -> Void)?
 
     init(onSave: @escaping () -> Void) {
         self.onSave = onSave
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 215),
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 260),
                             styleMask: [.titled, .closable, .nonactivatingPanel],
                             backing: .buffered, defer: false)
         panel.title = "Claude Usage Settings"
@@ -582,6 +614,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         let rd = UserDefaults.standard.integer(forKey: "billingDay_\(email)")
         renewalDayField?.stringValue = rd > 0 ? "\(rd)" : "1"
         loginItemCheckbox?.state = loadLaunchAtLogin() ? .on : .off
+        let stored = BrowserPreference.stored.rawValue
+        if let idx = BrowserPreference.allCases.firstIndex(where: { $0.rawValue == stored }) {
+            browserPopup?.selectItem(at: idx)
+        }
     }
 
     func showPanel() {
@@ -592,21 +628,30 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private func buildUI() {
         guard let v = window?.contentView else { return }
         let lbl1 = NSTextField(labelWithString: "Monthly plan cost (USD):")
-        lbl1.frame = NSRect(x: 20, y: 155, width: 180, height: 20); v.addSubview(lbl1)
-        costField = NSTextField(frame: NSRect(x: 205, y: 152, width: 80, height: 24))
+        lbl1.frame = NSRect(x: 20, y: 200, width: 180, height: 20); v.addSubview(lbl1)
+        costField = NSTextField(frame: NSRect(x: 205, y: 197, width: 80, height: 24))
         costField.placeholderString = "20.00"; costField.stringValue = "20.00"
         costField.delegate = self; v.addSubview(costField)
         let lbl2 = NSTextField(labelWithString: "Billing renewal day (1–31):")
-        lbl2.frame = NSRect(x: 20, y: 115, width: 180, height: 20); v.addSubview(lbl2)
-        renewalDayField = NSTextField(frame: NSRect(x: 205, y: 112, width: 80, height: 24))
+        lbl2.frame = NSRect(x: 20, y: 160, width: 180, height: 20); v.addSubview(lbl2)
+        renewalDayField = NSTextField(frame: NSRect(x: 205, y: 157, width: 80, height: 24))
         renewalDayField.placeholderString = "1"; renewalDayField.stringValue = "1"
         renewalDayField.delegate = self; v.addSubview(renewalDayField)
         loginItemCheckbox = NSButton(checkboxWithTitle: "Launch at login",
                                      target: self, action: #selector(launchAtLoginToggled))
-        loginItemCheckbox.frame = NSRect(x: 20, y: 78, width: 200, height: 20)
+        loginItemCheckbox.frame = NSRect(x: 20, y: 123, width: 200, height: 20)
         loginItemCheckbox.state = loadLaunchAtLogin() ? .on : .off; v.addSubview(loginItemCheckbox)
+        let lbl3 = NSTextField(labelWithString: "Session cookie source:")
+        lbl3.frame = NSRect(x: 20, y: 88, width: 160, height: 20); v.addSubview(lbl3)
+        browserPopup = NSPopUpButton(frame: NSRect(x: 185, y: 84, width: 115, height: 26))
+        for pref in BrowserPreference.allCases { browserPopup.addItem(withTitle: pref.displayName) }
+        let stored = BrowserPreference.stored.rawValue
+        if let idx = BrowserPreference.allCases.firstIndex(where: { $0.rawValue == stored }) {
+            browserPopup.selectItem(at: idx)
+        }
+        v.addSubview(browserPopup)
         let note = NSTextField(labelWithString: "Costs shown are API-equivalent estimates.")
-        note.frame = NSRect(x: 20, y: 50, width: 280, height: 20)
+        note.frame = NSRect(x: 20, y: 55, width: 280, height: 20)
         note.font = NSFont.systemFont(ofSize: 10); note.textColor = .secondaryLabelColor
         v.addSubview(note)
         let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelAction))
@@ -622,6 +667,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         UserDefaults.standard.set(max(0, val), forKey: "planCost_\(currentEmail)")
         let rd = min(max(Int(renewalDayField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 1, 1), 31)
         UserDefaults.standard.set(rd, forKey: "billingDay_\(currentEmail)")
+        let selIdx = browserPopup.indexOfSelectedItem
+        if selIdx >= 0 && selIdx < BrowserPreference.allCases.count {
+            UserDefaults.standard.set(BrowserPreference.allCases[selIdx].rawValue, forKey: "preferredBrowser")
+        }
         window?.orderOut(nil); onSave?()
     }
     @objc private func cancelAction() { window?.orderOut(nil) }
