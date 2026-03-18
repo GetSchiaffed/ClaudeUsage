@@ -215,15 +215,44 @@ final class LogParser {
 // MARK: - AccountDetector
 
 final class AccountDetector {
-    private let candidatePaths = [
+    private let staticCandidatePaths = [
         "/usr/local/bin/claude", "/opt/homebrew/bin/claude", "/usr/bin/claude",
         (NSHomeDirectory() as NSString).appendingPathComponent(".npm/bin/claude"),
         (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/claude"),
     ]
 
-    func detectSync() -> AccountInfo? {
+    // Finds the claude binary, including NVM-managed installs.
+    private func resolveClaude() -> String? {
         let fm = FileManager.default
-        guard let path = candidatePaths.first(where: { fm.isExecutableFile(atPath: $0) }) else { return nil }
+        // 1. Static known paths
+        if let found = staticCandidatePaths.first(where: { fm.isExecutableFile(atPath: $0) }) {
+            return found
+        }
+        // 2. NVM: glob ~/.nvm/versions/node/*/bin/claude and return the newest version
+        let nvmBase = (NSHomeDirectory() as NSString).appendingPathComponent(".nvm/versions/node")
+        if let versions = try? fm.contentsOfDirectory(atPath: nvmBase) {
+            let candidates = versions
+                .sorted()  // lexicographic sort puts higher versions last
+                .reversed()
+                .map { "\(nvmBase)/\($0)/bin/claude" }
+                .filter { fm.isExecutableFile(atPath: $0) }
+            if let found = candidates.first { return found }
+        }
+        // 3. Ask the shell (handles nvm shims, fnm, volta, etc.)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = ["-l", "-c", "which claude"]
+        proc.environment = ProcessInfo.processInfo.environment
+        let pipe = Pipe(); proc.standardOutput = pipe; proc.standardError = Pipe()
+        try? proc.run(); proc.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !out.isEmpty && fm.isExecutableFile(atPath: out) { return out }
+        return nil
+    }
+
+    func detectSync() -> AccountInfo? {
+        guard let path = resolveClaude() else { return nil }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = ["auth", "status"]
@@ -368,13 +397,31 @@ final class SessionCookieReader {
 
     enum ChromiumBrowser {
         case chrome, brave, arc
-        var cookiesPath: String {
+        var userDataDir: String {
             let home = NSHomeDirectory()
             switch self {
-            case .chrome: return "\(home)/Library/Application Support/Google/Chrome/Default/Cookies"
-            case .brave:  return "\(home)/Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies"
-            case .arc:    return "\(home)/Library/Application Support/Arc/User Data/Default/Cookies"
+            case .chrome: return "\(home)/Library/Application Support/Google/Chrome"
+            case .brave:  return "\(home)/Library/Application Support/BraveSoftware/Brave-Browser"
+            case .arc:    return "\(home)/Library/Application Support/Arc/User Data"
             }
+        }
+        // Returns all Cookies paths found across Default + Profile N directories.
+        var cookiesPaths: [String] {
+            let base = userDataDir
+            let fm = FileManager.default
+            var paths: [String] = []
+            // Always try Default first
+            let def = "\(base)/Default/Cookies"
+            if fm.fileExists(atPath: def) { paths.append(def) }
+            // Scan for Profile 1, Profile 2, … up to Profile 20
+            if let entries = try? fm.contentsOfDirectory(atPath: base) {
+                let profiles = entries.filter { $0.hasPrefix("Profile ") }.sorted()
+                for p in profiles {
+                    let path = "\(base)/\(p)/Cookies"
+                    if fm.fileExists(atPath: path) { paths.append(path) }
+                }
+            }
+            return paths
         }
         var keychainService: String {
             switch self {
@@ -393,39 +440,44 @@ final class SessionCookieReader {
     }
 
     private func readChromiumSessionKey(browser: ChromiumBrowser) -> String? {
-        let dbPath = browser.cookiesPath
-        guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
+        let paths = browser.cookiesPaths
+        guard !paths.isEmpty else { return nil }
 
         // Fetch decryption key from macOS Keychain (browser stores it there on first run)
         guard let keychainPassword = readKeychain(service: browser.keychainService,
                                                    account: browser.keychainAccount) else { return nil }
+        guard let key = pbkdf2Key(password: keychainPassword) else { return nil }
 
-        // Copy DB to /tmp since the browser may hold a read lock
-        let tmpPath = "/tmp/cu_cookies_\(arc4random()).db"
-        do { try FileManager.default.copyItem(atPath: dbPath, toPath: tmpPath) }
-        catch { return nil }
-        defer { try? FileManager.default.removeItem(atPath: tmpPath) }
+        // Try each profile directory in order until we find a valid sessionKey
+        for dbPath in paths {
+            // Copy DB to /tmp since the browser may hold a read lock
+            let tmpPath = "/tmp/cu_cookies_\(arc4random()).db"
+            do { try FileManager.default.copyItem(atPath: dbPath, toPath: tmpPath) }
+            catch { continue }
+            defer { try? FileManager.default.removeItem(atPath: tmpPath) }
 
-        // Query encrypted_value via sqlite3 CLI — returns X'hexhex' format
-        guard let hexStr = querySQLite(dbPath: tmpPath,
-            sql: "SELECT quote(encrypted_value) FROM cookies WHERE host_key LIKE '%claude.ai%' AND name='sessionKey' LIMIT 1"),
-              hexStr.hasPrefix("X'"), hexStr.hasSuffix("'")
-        else { return nil }
+            // Query encrypted_value via sqlite3 CLI — returns X'hexhex' format
+            guard let hexStr = querySQLite(dbPath: tmpPath,
+                sql: "SELECT quote(encrypted_value) FROM cookies WHERE host_key LIKE '%claude.ai%' AND name='sessionKey' LIMIT 1"),
+                  hexStr.hasPrefix("X'"), hexStr.hasSuffix("'")
+            else { continue }
 
-        let hex = String(hexStr.dropFirst(2).dropLast(1))
-        guard let encrypted = Data(hexString: hex), encrypted.count > 3 else { return nil }
+            let hex = String(hexStr.dropFirst(2).dropLast(1))
+            guard let encrypted = Data(hexString: hex), encrypted.count > 3 else { continue }
 
-        // Chromium v10 cookie format: v10 (3) | nonce (16) | ciphertext (rest)
-        // The 16-byte nonce is used as AES-CBC IV.
-        // First 16 bytes of decrypted plaintext are a metadata header — skip them.
-        guard encrypted.count > 19 else { return nil }
-        let nonce      = encrypted[3..<19]
-        let ciphertext = encrypted[19...]
-        guard let key       = pbkdf2Key(password: keychainPassword) else { return nil }
-        guard let decrypted = aesDecrypt(ciphertext: Data(ciphertext), key: key,
-                                         iv: Data(nonce)) else { return nil }
-        guard decrypted.count > 16 else { return nil }
-        return String(bytes: decrypted.dropFirst(16), encoding: .utf8)
+            // Chromium v10 cookie format: v10 (3) | nonce (16) | ciphertext (rest)
+            // The 16-byte nonce is used as AES-CBC IV.
+            // First 16 bytes of decrypted plaintext are a metadata header — skip them.
+            guard encrypted.count > 19 else { continue }
+            let nonce      = encrypted[3..<19]
+            let ciphertext = encrypted[19...]
+            guard let decrypted = aesDecrypt(ciphertext: Data(ciphertext), key: key,
+                                             iv: Data(nonce)) else { continue }
+            guard decrypted.count > 16 else { continue }
+            if let result = String(bytes: decrypted.dropFirst(16), encoding: .utf8),
+               !result.isEmpty { return result }
+        }
+        return nil
     }
 
     // Reads a password from macOS Keychain using the `security` CLI.
