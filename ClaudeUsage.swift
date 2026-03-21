@@ -15,6 +15,19 @@ import Foundation
 // Returns actual resetsAt timestamps + utilization%, same as Claude Code built-in panel.
 // Requires sessionKey cookie from Safari, Chrome, Brave, or Arc. Falls back to JSONL sliding-window estimate.
 
+// MARK: - Debug Logger
+
+private func debugLog(_ msg: String) {
+    let ts = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(ts)] \(msg)\n"
+    let path = "/tmp/claudeusage_debug.log"
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile(); fh.write(line.data(using: .utf8)!); fh.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
+    }
+}
+
 // MARK: - Data Structures
 
 struct TokenUsage {
@@ -226,6 +239,7 @@ final class AccountDetector {
         let fm = FileManager.default
         // 1. Static known paths
         if let found = staticCandidatePaths.first(where: { fm.isExecutableFile(atPath: $0) }) {
+            debugLog("resolveClaude: found at static path \(found)")
             return found
         }
         // 2. NVM: glob ~/.nvm/versions/node/*/bin/claude and return the newest version
@@ -236,7 +250,10 @@ final class AccountDetector {
                 .reversed()
                 .map { "\(nvmBase)/\($0)/bin/claude" }
                 .filter { fm.isExecutableFile(atPath: $0) }
-            if let found = candidates.first { return found }
+            if let found = candidates.first {
+                debugLog("resolveClaude: found via NVM at \(found)")
+                return found
+            }
         }
         // 3. Ask the shell (handles nvm shims, fnm, volta, etc.)
         let proc = Process()
@@ -247,28 +264,59 @@ final class AccountDetector {
         try? proc.run(); proc.waitUntilExit()
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !out.isEmpty && fm.isExecutableFile(atPath: out) { return out }
+        if !out.isEmpty && fm.isExecutableFile(atPath: out) {
+            debugLog("resolveClaude: found via shell at \(out)")
+            return out
+        }
+        debugLog("resolveClaude: NOT FOUND")
         return nil
     }
 
     func detectSync() -> AccountInfo? {
-        guard let path = resolveClaude() else { return nil }
+        guard let path = resolveClaude() else {
+            debugLog("detectSync: claude binary not found")
+            return nil
+        }
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = ["auth", "status"]
+        // claude is a `#!/usr/bin/env node` script — when launched from Finder
+        // (no shell env), `env` can't find `node`. Run it via the node binary
+        // sitting next to claude in the same NVM/bin directory.
+        let binDir = (path as NSString).deletingLastPathComponent
+        let nodePath = "\(binDir)/node"
+        if FileManager.default.isExecutableFile(atPath: nodePath) {
+            proc.executableURL = URL(fileURLWithPath: nodePath)
+            proc.arguments = [path, "auth", "status"]
+            debugLog("detectSync: using node at \(nodePath)")
+        } else {
+            proc.executableURL = URL(fileURLWithPath: path)
+            proc.arguments = ["auth", "status"]
+            // Ensure node is findable via PATH
+            var env = proc.environment ?? ProcessInfo.processInfo.environment
+            env["PATH"] = (env["PATH"] ?? "/usr/bin:/bin") + ":\(binDir)"
+            proc.environment = env
+            debugLog("detectSync: using claude directly with augmented PATH")
+        }
         let pipe = Pipe(); proc.standardOutput = pipe; proc.standardError = Pipe()
         var timedOut = false
         let timer = DispatchSource.makeTimerSource(queue: .global())
-        timer.schedule(deadline: .now() + 5)
+        timer.schedule(deadline: .now() + 10)
         timer.setEventHandler { timedOut = true; proc.terminate(); timer.cancel() }
         timer.resume()
+        let startTime = Date()
         do { try proc.run(); proc.waitUntilExit(); timer.cancel() }
-        catch { timer.cancel(); return nil }
-        if timedOut { return nil }
+        catch { timer.cancel(); debugLog("detectSync: process launch error"); return nil }
+        let elapsed = Date().timeIntervalSince(startTime)
+        if timedOut { debugLog("detectSync: TIMED OUT after \(String(format: "%.1f", elapsed))s"); return nil }
+        debugLog("detectSync: completed in \(String(format: "%.1f", elapsed))s, exit=\(proc.terminationStatus)")
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let rawOut = String(data: data, encoding: .utf8) ?? "(binary)"
+        debugLog("detectSync raw output (\(data.count) bytes): \(rawOut.prefix(500))")
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               (json["loggedIn"] as? Bool) == true,
-              let email = json["email"] as? String, !email.isEmpty else { return nil }
+              let email = json["email"] as? String, !email.isEmpty else {
+            debugLog("detectSync: JSON parse failed or not logged in")
+            return nil
+        }
         return AccountInfo(
             email: email,
             subscriptionType: (json["subscriptionType"] as? String) ?? "unknown",
@@ -512,17 +560,19 @@ final class SessionCookieReader {
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         proc.arguments = ["find-generic-password", "-w", "-s", service, "-a", account]
         let pipe = Pipe(); proc.standardOutput = pipe; proc.standardError = Pipe()
-        // Timeout: Keychain prompt may appear if not cached — kill after 3s
         var timedOut = false
         let timer = DispatchSource.makeTimerSource(queue: .global())
-        timer.schedule(deadline: .now() + 3)
+        timer.schedule(deadline: .now() + 10)
         timer.setEventHandler { timedOut = true; proc.terminate(); timer.cancel() }
         timer.resume()
+        let startTime = Date()
         do { try proc.run(); proc.waitUntilExit(); timer.cancel() }
-        catch { timer.cancel(); return nil }
-        if timedOut { return nil }
+        catch { timer.cancel(); debugLog("readKeychain(\(service)): launch error"); return nil }
+        let elapsed = Date().timeIntervalSince(startTime)
+        if timedOut { debugLog("readKeychain(\(service)): TIMED OUT after \(String(format: "%.1f", elapsed))s"); return nil }
         let out = pipe.fileHandleForReading.readDataToEndOfFile()
         let s = String(data: out, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        debugLog("readKeychain(\(service)): \(s.isEmpty ? "EMPTY" : "ok (\(s.count) chars)") in \(String(format: "%.1f", elapsed))s")
         return s.isEmpty ? nil : s
     }
 
@@ -843,11 +893,19 @@ final class StatusBarController {
     @objc func refresh() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            debugLog("--- refresh START ---")
             let records = self.parser.parseAll()
+            debugLog("records: \(records.count)")
             let account = self.accountDetector.detectSync()
+            debugLog("account: \(account?.email ?? "nil"), orgId: \(account?.orgId ?? "nil")")
             var live: UsageAPIClient.Response? = nil
-            if let orgId = account?.orgId, let key = self.cookieReader.readSessionKey() {
+            let key = self.cookieReader.readSessionKey()
+            debugLog("sessionKey: \(key != nil ? "found (\(key!.prefix(8))...)" : "nil"), browser pref: \(BrowserPreference.stored.rawValue)")
+            if let orgId = account?.orgId, let key {
                 live = self.usageAPI.fetchSync(orgId: orgId, sessionKey: key)
+                debugLog("API response: \(live != nil ? "OK (5h: \(live!.fiveHour?.utilization ?? -1)%)" : "nil")")
+            } else {
+                debugLog("SKIPPED API call — orgId or sessionKey missing")
             }
             DispatchQueue.main.async {
                 self.allRecords = records; self.currentAccount = account
