@@ -329,18 +329,43 @@ final class SessionCookieReader {
 
     // MARK: Public entry point
 
+    /// Last browser that successfully provided a sessionKey (used to prioritize in auto mode).
+    private static var lastSuccessfulBrowser: BrowserPreference?
+
     func readSessionKey() -> String? {
         switch BrowserPreference.stored {
-        case .auto:
-            return readSafariSessionKey()
-                ?? readChromiumSessionKey(browser: .chrome)
-                ?? readChromiumSessionKey(browser: .brave)
-                ?? readChromiumSessionKey(browser: .arc)
+        case .auto:   return readSessionKeyAuto()
         case .safari: return readSafariSessionKey()
         case .chrome: return readChromiumSessionKey(browser: .chrome)
         case .brave:  return readChromiumSessionKey(browser: .brave)
         case .arc:    return readChromiumSessionKey(browser: .arc)
         }
+    }
+
+    /// Auto mode: tries the last successful browser first, then all others.
+    /// Each browser is attempted independently so a single failure doesn't block the rest.
+    private func readSessionKeyAuto() -> String? {
+        typealias Reader = () -> String?
+        let all: [(BrowserPreference, Reader)] = [
+            (.safari, { self.readSafariSessionKey() }),
+            (.chrome, { self.readChromiumSessionKey(browser: .chrome) }),
+            (.brave,  { self.readChromiumSessionKey(browser: .brave) }),
+            (.arc,    { self.readChromiumSessionKey(browser: .arc) }),
+        ]
+        // Prioritize last successful browser
+        var ordered = all
+        if let last = Self.lastSuccessfulBrowser,
+           let idx = ordered.firstIndex(where: { $0.0 == last }) {
+            let entry = ordered.remove(at: idx)
+            ordered.insert(entry, at: 0)
+        }
+        for (browser, reader) in ordered {
+            if let key = reader(), !key.isEmpty {
+                Self.lastSuccessfulBrowser = browser
+                return key
+            }
+        }
+        return nil
     }
 
     // MARK: Safari (binary cookies, plaintext)
@@ -741,6 +766,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
             let binary = Bundle.main.executablePath ?? ProcessInfo.processInfo.arguments[0]
             let plist: [String: Any] = ["Label": "com.claudeusage.app", "Program": binary,
                 "RunAtLoad": true, "KeepAlive": false,
+                "StartupDelay": 30,
                 "StandardOutPath": "/tmp/claudeusage.log",
                 "StandardErrorPath": "/tmp/claudeusage.err"]
             if let data = try? PropertyListSerialization.data(fromPropertyList: plist,
@@ -763,6 +789,9 @@ final class StatusBarController {
 
     private let statusItem: NSStatusItem
     private var refreshTimer: Timer?
+    private var startupRetryTimer: Timer?
+    private var startupRetryCount = 0
+    private static let maxStartupRetries = 20 // 20 × 15s = 5 min
     private var allRecords: [UsageRecord] = []
     private var currentAccount: AccountInfo?
     private var liveUsage: UsageAPIClient.Response?
@@ -792,7 +821,24 @@ final class StatusBarController {
         refresh()
         refreshTimer = Timer.scheduledTimer(timeInterval: 60, target: self,
                                             selector: #selector(refresh), userInfo: nil, repeats: true)
+        // At startup the Keychain/browser may not be ready yet — retry every 15s until we get API data.
+        startupRetryTimer = Timer.scheduledTimer(timeInterval: 15, target: self,
+                                                 selector: #selector(startupRetry), userInfo: nil, repeats: true)
     }
+
+    @objc private func startupRetry() {
+        startupRetryCount += 1
+        if liveUsage != nil || startupRetryCount >= Self.maxStartupRetries {
+            startupRetryTimer?.invalidate()
+            startupRetryTimer = nil
+            return
+        }
+        refresh()
+    }
+
+    /// Number of consecutive API failures — used to keep the last good response visible.
+    private var apiFailCount = 0
+    private static let maxStaleRetries = 3
 
     @objc func refresh() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -805,7 +851,17 @@ final class StatusBarController {
             }
             DispatchQueue.main.async {
                 self.allRecords = records; self.currentAccount = account
-                self.liveUsage = live; self.isLoading = false
+                if let live {
+                    self.liveUsage = live
+                    self.apiFailCount = 0
+                } else if self.liveUsage != nil {
+                    // Keep stale data for a few cycles so intermittent failures don't blank the UI
+                    self.apiFailCount += 1
+                    if self.apiFailCount > StatusBarController.maxStaleRetries {
+                        self.liveUsage = nil
+                    }
+                }
+                self.isLoading = false
                 if let email = account?.email {
                     UserDefaults.standard.set(email, forKey: "lastKnownEmail")
                 }
