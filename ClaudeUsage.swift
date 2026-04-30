@@ -69,9 +69,16 @@ struct AccountInfo {
 enum CostCalculator {
     private struct Rates { let input, output, cacheCreation, cacheRead: Double }
 
+    // Per-MTok USD rates (≤200K context). Anthropic doubles them for >200K context
+    // (1M-context Opus 4.7 / Sonnet 4.x). The JSONL doesn't expose context size at
+    // request time, so we use the standard tier — costs are slight under-estimates
+    // for long-context turns. Rates current as of Apr 2026 (Opus 4.7, Sonnet 4.6, Haiku 4.5).
     private static func rates(for model: String) -> Rates {
         let lower = model.lowercased()
-        if lower.hasPrefix("claude-opus-4") {
+        if lower.hasPrefix("claude-opus-4") || lower.contains("opus-4") {
+            // Opus 4.x (incl. 4.6, 4.7): same pricing tier.
+            // Restricted to opus-4 — Opus 3 had different pricing and a future
+            // Opus 5/6 will likely change tier.
             return Rates(input: 15.0, output: 75.0, cacheCreation: 18.75, cacheRead: 1.50)
         } else if lower.hasPrefix("claude-sonnet-4") || lower.contains("sonnet") {
             return Rates(input: 3.0, output: 15.0, cacheCreation: 3.75, cacheRead: 0.30)
@@ -277,24 +284,32 @@ final class AccountDetector {
             debugLog("detectSync: claude binary not found")
             return nil
         }
+        // Resolve symlink chains fully (Homebrew can have multi-hop:
+        // /opt/homebrew/bin/claude → ../Cellar/.../claude → claude.exe).
+        let realPath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
         let proc = Process()
-        // claude is a `#!/usr/bin/env node` script — when launched from Finder
-        // (no shell env), `env` can't find `node`. Run it via the node binary
-        // sitting next to claude in the same NVM/bin directory.
         let binDir = (path as NSString).deletingLastPathComponent
         let nodePath = "\(binDir)/node"
-        if FileManager.default.isExecutableFile(atPath: nodePath) {
+        // Two install shapes today:
+        //   1. JS script with `#!/usr/bin/env node` shebang (npm/NVM install)
+        //   2. Bun-compiled native Mach-O binary (newer claude.exe distribution)
+        // Detect by reading the first two bytes — only shebang scripts need node.
+        let isShebang: Bool = {
+            guard let fh = FileHandle(forReadingAtPath: realPath) else { return false }
+            defer { try? fh.close() }
+            return fh.readData(ofLength: 2) == Data([0x23, 0x21]) // "#!"
+        }()
+        if isShebang, FileManager.default.isExecutableFile(atPath: nodePath) {
             proc.executableURL = URL(fileURLWithPath: nodePath)
             proc.arguments = [path, "auth", "status"]
-            debugLog("detectSync: using node at \(nodePath)")
+            debugLog("detectSync: shebang script — using node at \(nodePath)")
         } else {
             proc.executableURL = URL(fileURLWithPath: path)
             proc.arguments = ["auth", "status"]
-            // Ensure node is findable via PATH
             var env = proc.environment ?? ProcessInfo.processInfo.environment
             env["PATH"] = (env["PATH"] ?? "/usr/bin:/bin") + ":\(binDir)"
             proc.environment = env
-            debugLog("detectSync: using claude directly with augmented PATH")
+            debugLog("detectSync: native binary — running directly (\(realPath))")
         }
         let pipe = Pipe(); proc.standardOutput = pipe; proc.standardError = Pipe()
         var timedOut = false
@@ -935,8 +950,13 @@ final class StatusBarController {
         let now = Date()
         let todayRecs = parser.records(for: now, from: allRecords)
         let todayCost = todayRecs.reduce(0.0) { $0 + $1.cost }
-        let todayIn   = todayRecs.reduce(0) { $0 + $1.usage.inputTokens + $1.usage.cacheReadTokens }
-        let todayOut  = todayRecs.reduce(0) { $0 + $1.usage.outputTokens }
+        let todayInFresh = todayRecs.reduce(0) { $0 + $1.usage.inputTokens }
+        let todayCacheR  = todayRecs.reduce(0) { $0 + $1.usage.cacheReadTokens }
+        let todayCacheW  = todayRecs.reduce(0) { $0 + $1.usage.cacheCreationTokens }
+        let todayOut     = todayRecs.reduce(0) { $0 + $1.usage.outputTokens }
+        // Total ↓ includes all input-side tokens (fresh + cache read + cache write)
+        // so the breakdown caption underneath sums to the displayed total.
+        let todayIn      = todayInFresh + todayCacheR + todayCacheW
 
         updateTitle()
         menu.appearance = NSAppearance(named: isDarkMenu ? .darkAqua : .aqua)
@@ -956,6 +976,8 @@ final class StatusBarController {
         let df = DateFormatter(); df.dateFormat = "EEEE, d MMM"
         addHeader(menu, "Today  \u{00B7}  \(df.string(from: now))")
         addMono(menu, "\u{2193} \(CostCalculator.formatTokens(todayIn))  \u{2191} \(CostCalculator.formatTokens(todayOut))   \u{2022}   \(CostCalculator.formatCost(todayCost))")
+        // Breakdown: fresh input (billed full price) vs cache read (90% off) vs cache write (+25%)
+        addCaption(menu, "in: \(CostCalculator.formatTokens(todayInFresh)) fresh  \u{00B7}  \(CostCalculator.formatTokens(todayCacheR)) cache↺  \u{00B7}  \(CostCalculator.formatTokens(todayCacheW)) cache✎")
         menu.addItem(.separator())
 
         // ── Usage Windows ─────────────────────────────────────────────────────
