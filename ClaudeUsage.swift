@@ -38,7 +38,26 @@ struct TokenUsage {
     var totalTokens: Int { inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens }
 }
 
+enum Provider: String {
+    case claude, codex
+    /// Single-letter tag drawn in the menu bar when both providers are shown.
+    var menubarTag: String { self == .claude ? "A" : "O" }
+}
+
+/// Which provider(s) the always-visible menu bar icon renders.
+enum MenubarSource: String {
+    case claude, codex, both
+}
+
+/// A rolling-usage window: percent consumed (0-100) + when it resets.
+/// Shared by the Claude usage API and Codex's local rate-limit snapshots.
+struct Bucket {
+    let utilization: Double  // 0-100%
+    let resetsAt: Date?      // nil when no activity in window / unknown
+}
+
 struct UsageRecord {
+    let provider: Provider
     let sessionId: String
     let model: String
     let timestamp: Date
@@ -102,6 +121,72 @@ enum CostCalculator {
         if count >= 1_000_000 { return String(format: "%.1fM", Double(count)/1_000_000) }
         if count >= 1_000     { return String(format: "%.0fk", Double(count)/1_000) }
         return "\(count)"
+    }
+}
+
+// MARK: - CodexCostCalculator
+//
+// API-equivalent cost estimate for OpenAI Codex usage (same framing as Claude:
+// not real spend on a ChatGPT subscription, just list-price value of the tokens).
+// Rates per-MTok for the GPT-5 family (Codex runs on gpt-5-codex by default).
+enum CodexCostCalculator {
+    private struct Rates { let input, cachedInput, output: Double }
+
+    // Standard GPT-5 API list prices (USD per 1M tokens). Cached input is 90% off.
+    private static func rates(for model: String) -> Rates {
+        let m = model.lowercased()
+        if m.contains("nano") {
+            return Rates(input: 0.05, cachedInput: 0.005, output: 0.40)
+        } else if m.contains("mini") {
+            return Rates(input: 0.25, cachedInput: 0.025, output: 2.00)
+        } else {
+            // gpt-5 / gpt-5-codex / unknown → default to gpt-5 pricing
+            return Rates(input: 1.25, cachedInput: 0.125, output: 10.0)
+        }
+    }
+
+    // The Codex parser maps fresh input → inputTokens, cached input → cacheReadTokens,
+    // output → outputTokens, and leaves cacheCreationTokens at 0.
+    static func cost(for usage: TokenUsage, model: String) -> Double {
+        let r = rates(for: model); let M = 1_000_000.0
+        return (Double(usage.inputTokens)*r.input
+              + Double(usage.cacheReadTokens)*r.cachedInput
+              + Double(usage.outputTokens)*r.output) / M
+    }
+}
+
+// MARK: - UsageMath
+//
+// Provider-agnostic aggregation over UsageRecord arrays — shared by LogParser (Claude)
+// and CodexLogParser (Codex) so date/session math lives in one place.
+enum UsageMath {
+    static func records(for date: Date, from all: [UsageRecord]) -> [UsageRecord] {
+        let cal = Calendar.current; let start = cal.startOfDay(for: date)
+        guard let end = cal.date(byAdding: .day, value: 1, to: start) else { return [] }
+        return all.filter { $0.timestamp >= start && $0.timestamp < end }
+    }
+
+    static func recordsForCurrentMonth(from all: [UsageRecord]) -> [UsageRecord] {
+        let cal = Calendar.current; let now = Date()
+        let c = cal.dateComponents([.year, .month], from: now)
+        guard let start = cal.date(from: c),
+              let end = cal.date(byAdding: .month, value: 1, to: start) else { return [] }
+        return all.filter { $0.timestamp >= start && $0.timestamp < end }
+    }
+
+    static func recentSessions(from all: [UsageRecord], count: Int, meta: [String: SessionMeta])
+        -> [(sessionId: String, lastTimestamp: Date, cost: Double, projectName: String)]
+    {
+        var map: [String: (Date, Double)] = [:]
+        for r in all {
+            if let ex = map[r.sessionId] { map[r.sessionId] = (max(ex.0, r.timestamp), ex.1 + r.cost) }
+            else { map[r.sessionId] = (r.timestamp, r.cost) }
+        }
+        return map
+            .map { (sessionId: $0.key, lastTimestamp: $0.value.0, cost: $0.value.1,
+                    projectName: meta[$0.key]?.projectName ?? "—") }
+            .sorted { $0.lastTimestamp > $1.lastTimestamp }
+            .prefix(count).map { $0 }
     }
 }
 
@@ -187,7 +272,7 @@ final class LogParser {
         guard inp + out + cc + cr > 0 else { return nil }
         let usage = TokenUsage(inputTokens: inp, outputTokens: out,
                                cacheCreationTokens: cc, cacheReadTokens: cr)
-        return UsageRecord(sessionId: sid, model: model, timestamp: ts,
+        return UsageRecord(provider: .claude, sessionId: sid, model: model, timestamp: ts,
                            usage: usage, cost: CostCalculator.cost(for: usage, model: model))
     }
 
@@ -203,32 +288,217 @@ final class LogParser {
     }
 
     func records(for date: Date, from all: [UsageRecord]) -> [UsageRecord] {
-        let cal = Calendar.current; let start = cal.startOfDay(for: date)
-        guard let end = cal.date(byAdding: .day, value: 1, to: start) else { return [] }
-        return all.filter { $0.timestamp >= start && $0.timestamp < end }
+        UsageMath.records(for: date, from: all)
     }
 
     func recordsForCurrentMonth(from all: [UsageRecord]) -> [UsageRecord] {
-        let cal = Calendar.current; let now = Date()
-        let c = cal.dateComponents([.year, .month], from: now)
-        guard let start = cal.date(from: c),
-              let end = cal.date(byAdding: .month, value: 1, to: start) else { return [] }
-        return all.filter { $0.timestamp >= start && $0.timestamp < end }
+        UsageMath.recordsForCurrentMonth(from: all)
     }
 
     func recentSessions(from all: [UsageRecord], count: Int)
         -> [(sessionId: String, lastTimestamp: Date, cost: Double, projectName: String)]
     {
-        var map: [String: (Date, Double)] = [:]
-        for r in all {
-            if let ex = map[r.sessionId] { map[r.sessionId] = (max(ex.0, r.timestamp), ex.1 + r.cost) }
-            else { map[r.sessionId] = (r.timestamp, r.cost) }
+        UsageMath.recentSessions(from: all, count: count, meta: sessionMeta)
+    }
+}
+
+// MARK: - CodexLogParser
+//
+// Reads OpenAI Codex CLI session logs from ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+// (base dir overridable via CODEX_HOME). Unlike Claude, the rolling-window limits live IN
+// the local files: each `token_count` event carries `rate_limits` with primary (≈5h) and
+// secondary (≈weekly) windows. No auth / cookie / network needed.
+//
+// Rollout line envelope (one JSON object per line):
+//   { "timestamp": "...", "type": "<kind>", "payload": { ... } }
+// Kinds used here:
+//   session_meta → payload.cwd, payload.git.branch
+//   turn_context → payload.model
+//   event_msg    → payload.type == "token_count" → payload.info (tokens) + payload.rate_limits
+//
+// Token usage in info.total_token_usage is cumulative per session; we diff consecutive
+// totals to recover per-turn deltas, immune to events re-emitted for rate-limit-only updates.
+
+final class CodexLogParser {
+
+    private let baseURL: URL
+    private(set) var sessionMeta: [String: SessionMeta] = [:]
+    // Latest non-null rate-limit snapshot found during the most recent parseAll().
+    private(set) var latestPrimary: Bucket?
+    private(set) var latestSecondary: Bucket?
+    private(set) var latestPlan: String?
+
+    init() {
+        let env = ProcessInfo.processInfo.environment["CODEX_HOME"]
+        if let env, !env.isEmpty {
+            baseURL = URL(fileURLWithPath: (env as NSString).expandingTildeInPath)
+        } else {
+            baseURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
         }
-        return map
-            .map { (sessionId: $0.key, lastTimestamp: $0.value.0, cost: $0.value.1,
-                    projectName: sessionMeta[$0.key]?.projectName ?? "—") }
-            .sorted { $0.lastTimestamp > $1.lastTimestamp }
-            .prefix(count).map { $0 }
+    }
+
+    private var sessionsURL: URL { baseURL.appendingPathComponent("sessions") }
+    private var archivedURL: URL { baseURL.appendingPathComponent("archived_sessions") }
+
+    var isInstalled: Bool { FileManager.default.fileExists(atPath: sessionsURL.path) }
+
+    // Date-sharded dirs (YYYY/MM/DD) for the last `days` days, across sessions + archived.
+    private func recentDateDirs(days: Int, now: Date) -> [URL] {
+        let cal = Calendar.current
+        var dirs: [URL] = []
+        for offset in 0..<days {
+            guard let d = cal.date(byAdding: .day, value: -offset, to: now) else { continue }
+            let rel = String(format: "%04d/%02d/%02d",
+                             cal.component(.year, from: d),
+                             cal.component(.month, from: d),
+                             cal.component(.day, from: d))
+            dirs.append(sessionsURL.appendingPathComponent(rel))
+            dirs.append(archivedURL.appendingPathComponent(rel))
+        }
+        return dirs
+    }
+
+    /// Latest rate-limit snapshot seen while scanning, tracked by event timestamp.
+    private struct RLSnapshot { let ts: Date; let primary: Bucket?; let secondary: Bucket?; let plan: String? }
+
+    func parseAll() -> [UsageRecord] {
+        latestPrimary = nil; latestSecondary = nil; latestPlan = nil; sessionMeta = [:]
+        guard isInstalled else { return [] }
+        let fm = FileManager.default
+        let f1 = ISO8601DateFormatter(); f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let f2 = ISO8601DateFormatter(); f2.formatOptions = [.withInternetDateTime]
+
+        var records: [UsageRecord] = []
+        var meta: [String: SessionMeta] = [:]
+        var latest: RLSnapshot? = nil
+        // 9 days covers Today + the 7d window with timezone margin.
+        for dir in recentDateDirs(days: 9, now: Date()) {
+            guard let files = try? fm.contentsOfDirectory(at: dir,
+                includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+                .filter({ $0.pathExtension == "jsonl" }) else { continue }
+            for file in files {
+                let (recs, m, rl) = parseFile(at: file, f1: f1, f2: f2)
+                records.append(contentsOf: recs)
+                for (k, v) in m { meta[k] = v }
+                if let rl, latest == nil || rl.ts > latest!.ts { latest = rl }
+            }
+        }
+        sessionMeta = meta
+        if let latest { latestPrimary = latest.primary; latestSecondary = latest.secondary; latestPlan = latest.plan }
+        return records.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private func parseFile(at url: URL, f1: ISO8601DateFormatter, f2: ISO8601DateFormatter)
+        -> ([UsageRecord], [String: SessionMeta], RLSnapshot?)
+    {
+        guard let data = try? Data(contentsOf: url) else { return ([], [:], nil) }
+        let sid = url.deletingPathExtension().lastPathComponent  // rollout-<id>
+        let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey])
+            .contentModificationDate) ?? Date()
+
+        var records: [UsageRecord] = []
+        var meta: [String: SessionMeta] = [:]
+        var latest: RLSnapshot? = nil
+        var currentModel = "gpt-5-codex"
+        var prevIn = 0, prevCached = 0, prevOut = 0
+
+        // Build one record from a per-turn delta (fresh input excludes cached).
+        func emit(dIn: Int, dCached: Int, dOut: Int, ts: Date) {
+            let fresh = max(0, dIn - dCached)
+            guard fresh + dCached + dOut > 0 else { return }
+            let usage = TokenUsage(inputTokens: fresh, outputTokens: dOut,
+                                   cacheCreationTokens: 0, cacheReadTokens: dCached)
+            records.append(UsageRecord(provider: .codex, sessionId: sid, model: currentModel,
+                timestamp: ts, usage: usage,
+                cost: CodexCostCalculator.cost(for: usage, model: currentModel)))
+        }
+
+        func parseDate(_ s: Any?) -> Date? {
+            guard let str = s as? String else { return nil }
+            return f1.date(from: str) ?? f2.date(from: str)
+        }
+
+        data.withUnsafeBytes { ptr in
+            var ls = ptr.startIndex
+            for i in ptr.indices {
+                let isNL = ptr[i] == UInt8(ascii: "\n")
+                let isEnd = i == ptr.index(before: ptr.endIndex)
+                if isNL || isEnd {
+                    let end = isNL ? i : ptr.endIndex
+                    if end > ls {
+                        let d = Data(ptr[ls..<end])
+                        if let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                           let type = json["type"] as? String {
+                            let payload = json["payload"] as? [String: Any]
+                            let ts = parseDate(json["timestamp"]) ?? mtime
+                            switch type {
+                            case "session_meta":
+                                if let p = payload, let cwd = p["cwd"] as? String, !cwd.isEmpty {
+                                    let branch = (p["git"] as? [String: Any])?["branch"] as? String
+                                    meta[sid] = SessionMeta(cwd: cwd, gitBranch: branch)
+                                }
+                            case "turn_context":
+                                if let p = payload, let model = p["model"] as? String, !model.isEmpty {
+                                    currentModel = model
+                                }
+                            case "event_msg":
+                                guard let p = payload, (p["type"] as? String) == "token_count" else { break }
+                                if let info = p["info"] as? [String: Any] {
+                                    if let tot = info["total_token_usage"] as? [String: Any] {
+                                        // Cumulative totals → diff to per-turn delta.
+                                        let tIn = (tot["input_tokens"] as? Int) ?? 0
+                                        let tCached = (tot["cached_input_tokens"] as? Int) ?? 0
+                                        let tOut = (tot["output_tokens"] as? Int) ?? 0
+                                        if tIn < prevIn || tOut < prevOut { prevIn = 0; prevCached = 0; prevOut = 0 }
+                                        emit(dIn: tIn - prevIn, dCached: max(0, tCached - prevCached),
+                                             dOut: tOut - prevOut, ts: ts)
+                                        prevIn = tIn; prevCached = tCached; prevOut = tOut
+                                    } else if let last = info["last_token_usage"] as? [String: Any] {
+                                        // Older format: per-turn deltas given directly.
+                                        emit(dIn: (last["input_tokens"] as? Int) ?? 0,
+                                             dCached: (last["cached_input_tokens"] as? Int) ?? 0,
+                                             dOut: (last["output_tokens"] as? Int) ?? 0, ts: ts)
+                                    }
+                                }
+                                if let rl = p["rate_limits"] as? [String: Any] {
+                                    let primary = bucket(from: rl["primary"], f1: f1, f2: f2)
+                                    let secondary = bucket(from: rl["secondary"], f1: f1, f2: f2)
+                                    if (primary != nil || secondary != nil),
+                                       latest == nil || ts > latest!.ts {
+                                        latest = RLSnapshot(ts: ts, primary: primary, secondary: secondary,
+                                                            plan: rl["plan_type"] as? String)
+                                    }
+                                }
+                            default: break
+                            }
+                        }
+                    }
+                    ls = isNL ? ptr.index(after: i) : ptr.endIndex
+                }
+            }
+        }
+        return (records, meta, latest)
+    }
+
+    // Maps a Codex RateLimitWindow JSON object → Bucket.
+    private func bucket(from any: Any?, f1: ISO8601DateFormatter, f2: ISO8601DateFormatter) -> Bucket? {
+        guard let w = any as? [String: Any] else { return nil }
+        let used = (w["used_percent"] as? Double) ?? (w["used_percent"] as? Int).map(Double.init) ?? 0
+        var reset: Date? = nil
+        if let secs = w["resets_at"] as? Double { reset = Date(timeIntervalSince1970: secs) }
+        else if let secs = w["resets_at"] as? Int { reset = Date(timeIntervalSince1970: Double(secs)) }
+        else if let s = w["resets_at"] as? String { reset = f1.date(from: s) ?? f2.date(from: s) }
+        return Bucket(utilization: used, resetsAt: reset)
+    }
+
+    // MARK: aggregation (shared with Claude via UsageMath)
+    func records(for date: Date, from all: [UsageRecord]) -> [UsageRecord] {
+        UsageMath.records(for: date, from: all)
+    }
+    func recentSessions(from all: [UsageRecord], count: Int)
+        -> [(sessionId: String, lastTimestamp: Date, cost: Double, projectName: String)]
+    {
+        UsageMath.recentSessions(from: all, count: count, meta: sessionMeta)
     }
 }
 
@@ -686,11 +956,6 @@ private extension Data {
 
 final class UsageAPIClient {
 
-    struct Bucket {
-        let utilization: Double  // 0-100%
-        let resetsAt: Date?      // nil when no activity in window
-    }
-
     struct Response {
         let fiveHour: Bucket?
         let sevenDay: Bucket?
@@ -735,11 +1000,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var renewalDayField: NSTextField!
     private var loginItemCheckbox: NSButton!
     private var browserPopup: NSPopUpButton!
+    private var codexCheckbox: NSButton!
+    private var menubarPopup: NSPopUpButton!
     private var onSave: (() -> Void)?
+
+    /// Menu-bar source options, indexed to match the popup item order.
+    private static let menubarOrder = ["claude", "codex", "both"]
 
     init(onSave: @escaping () -> Void) {
         self.onSave = onSave
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 260),
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 340),
                             styleMask: [.titled, .closable, .nonactivatingPanel],
                             backing: .buffered, defer: false)
         panel.title = "Claude Usage Settings"
@@ -760,6 +1030,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         if let idx = BrowserPreference.allCases.firstIndex(where: { $0.rawValue == stored }) {
             browserPopup?.selectItem(at: idx)
         }
+        codexCheckbox?.state = codexEnabledStored ? .on : .off
+        if let idx = Self.menubarOrder.firstIndex(of: menubarSourceStored) {
+            menubarPopup?.selectItem(at: idx)
+        }
     }
 
     func showPanel() {
@@ -770,30 +1044,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
     private func buildUI() {
         guard let v = window?.contentView else { return }
         let lbl1 = NSTextField(labelWithString: "Monthly plan cost (USD):")
-        lbl1.frame = NSRect(x: 20, y: 200, width: 180, height: 20); v.addSubview(lbl1)
-        costField = NSTextField(frame: NSRect(x: 205, y: 197, width: 80, height: 24))
+        lbl1.frame = NSRect(x: 20, y: 300, width: 180, height: 20); v.addSubview(lbl1)
+        costField = NSTextField(frame: NSRect(x: 205, y: 297, width: 80, height: 24))
         costField.placeholderString = "20.00"; costField.stringValue = "20.00"
         costField.delegate = self; v.addSubview(costField)
         let lbl2 = NSTextField(labelWithString: "Billing renewal day (1–31):")
-        lbl2.frame = NSRect(x: 20, y: 160, width: 180, height: 20); v.addSubview(lbl2)
-        renewalDayField = NSTextField(frame: NSRect(x: 205, y: 157, width: 80, height: 24))
+        lbl2.frame = NSRect(x: 20, y: 262, width: 180, height: 20); v.addSubview(lbl2)
+        renewalDayField = NSTextField(frame: NSRect(x: 205, y: 259, width: 80, height: 24))
         renewalDayField.placeholderString = "1"; renewalDayField.stringValue = "1"
         renewalDayField.delegate = self; v.addSubview(renewalDayField)
         loginItemCheckbox = NSButton(checkboxWithTitle: "Launch at login",
                                      target: self, action: #selector(launchAtLoginToggled))
-        loginItemCheckbox.frame = NSRect(x: 20, y: 123, width: 200, height: 20)
+        loginItemCheckbox.frame = NSRect(x: 20, y: 226, width: 200, height: 20)
         loginItemCheckbox.state = loadLaunchAtLogin() ? .on : .off; v.addSubview(loginItemCheckbox)
         let lbl3 = NSTextField(labelWithString: "Session cookie source:")
-        lbl3.frame = NSRect(x: 20, y: 88, width: 160, height: 20); v.addSubview(lbl3)
-        browserPopup = NSPopUpButton(frame: NSRect(x: 185, y: 84, width: 115, height: 26))
+        lbl3.frame = NSRect(x: 20, y: 190, width: 160, height: 20); v.addSubview(lbl3)
+        browserPopup = NSPopUpButton(frame: NSRect(x: 185, y: 186, width: 115, height: 26))
         for pref in BrowserPreference.allCases { browserPopup.addItem(withTitle: pref.displayName) }
         let stored = BrowserPreference.stored.rawValue
         if let idx = BrowserPreference.allCases.firstIndex(where: { $0.rawValue == stored }) {
             browserPopup.selectItem(at: idx)
         }
         v.addSubview(browserPopup)
+        // ── Codex ──
+        codexCheckbox = NSButton(checkboxWithTitle: "Track Codex usage", target: nil, action: nil)
+        codexCheckbox.frame = NSRect(x: 20, y: 152, width: 220, height: 20)
+        codexCheckbox.state = codexEnabledStored ? .on : .off; v.addSubview(codexCheckbox)
+        let lbl4 = NSTextField(labelWithString: "Menu bar shows:")
+        lbl4.frame = NSRect(x: 20, y: 116, width: 160, height: 20); v.addSubview(lbl4)
+        menubarPopup = NSPopUpButton(frame: NSRect(x: 185, y: 112, width: 115, height: 26))
+        for opt in ["Claude", "Codex", "Both"] { menubarPopup.addItem(withTitle: opt) }
+        if let idx = Self.menubarOrder.firstIndex(of: menubarSourceStored) {
+            menubarPopup.selectItem(at: idx)
+        }
+        v.addSubview(menubarPopup)
         let note = NSTextField(labelWithString: "Costs shown are API-equivalent estimates.")
-        note.frame = NSRect(x: 20, y: 55, width: 280, height: 20)
+        note.frame = NSRect(x: 20, y: 78, width: 280, height: 20)
         note.font = NSFont.systemFont(ofSize: 10); note.textColor = .secondaryLabelColor
         v.addSubview(note)
         let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelAction))
@@ -804,6 +1090,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         save.keyEquivalent = "\r"; v.addSubview(save)
     }
 
+    // Global (not per-email) Codex settings, with defaults matching StatusBarController.
+    private var codexEnabledStored: Bool {
+        UserDefaults.standard.object(forKey: "codexEnabled") == nil
+            ? true : UserDefaults.standard.bool(forKey: "codexEnabled")
+    }
+    private var menubarSourceStored: String {
+        UserDefaults.standard.string(forKey: "menubarSource") ?? "both"
+    }
+
     @objc private func saveAction() {
         let val = Double(costField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 20.0
         UserDefaults.standard.set(max(0, val), forKey: "planCost_\(currentEmail)")
@@ -812,6 +1107,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTe
         let selIdx = browserPopup.indexOfSelectedItem
         if selIdx >= 0 && selIdx < BrowserPreference.allCases.count {
             UserDefaults.standard.set(BrowserPreference.allCases[selIdx].rawValue, forKey: "preferredBrowser")
+        }
+        UserDefaults.standard.set(codexCheckbox.state == .on, forKey: "codexEnabled")
+        let mi = menubarPopup.indexOfSelectedItem
+        if mi >= 0 && mi < Self.menubarOrder.count {
+            UserDefaults.standard.set(Self.menubarOrder[mi], forKey: "menubarSource")
         }
         window?.orderOut(nil); onSave?()
     }
@@ -867,10 +1167,29 @@ final class StatusBarController {
     private let usageAPI = UsageAPIClient()
     private var settingsWindowController: SettingsWindowController?
 
+    // Codex (OpenAI) — all data is local; no account/API/cookie needed.
+    private let codexParser = CodexLogParser()
+    private var codexRecords: [UsageRecord] = []
+    private var codexPrimary: Bucket?
+    private var codexSecondary: Bucket?
+    private var codexPlan: String?
+    private var codexInstalled = false
+
     private var isDarkMenu: Bool {
         get { UserDefaults.standard.object(forKey: "darkMenu") == nil
               ? true : UserDefaults.standard.bool(forKey: "darkMenu") }
         set { UserDefaults.standard.set(newValue, forKey: "darkMenu") }
+    }
+
+    /// Whether to track OpenAI Codex usage alongside Claude (default on).
+    private var codexEnabled: Bool {
+        UserDefaults.standard.object(forKey: "codexEnabled") == nil
+            ? true : UserDefaults.standard.bool(forKey: "codexEnabled")
+    }
+
+    /// Which provider(s) the menu bar icon shows (default both).
+    private var menubarSource: MenubarSource {
+        MenubarSource(rawValue: UserDefaults.standard.string(forKey: "menubarSource") ?? "both") ?? .both
     }
 
     init() {
@@ -882,7 +1201,8 @@ final class StatusBarController {
     }
 
     func start() {
-        settingsWindowController = SettingsWindowController { [weak self] in self?.rebuildMenu() }
+        // Re-run a full refresh on save so toggling Codex / menu-bar source takes effect now.
+        settingsWindowController = SettingsWindowController { [weak self] in self?.refresh() }
         refresh()
         refreshTimer = Timer.scheduledTimer(timeInterval: 60, target: self,
                                             selector: #selector(refresh), userInfo: nil, repeats: true)
@@ -922,8 +1242,26 @@ final class StatusBarController {
             } else {
                 debugLog("SKIPPED API call — orgId or sessionKey missing")
             }
+
+            // Codex — pure local file reads (no network). Rolling windows come from the
+            // latest non-null rate_limits snapshot in the session logs.
+            var codexRecs: [UsageRecord] = []
+            var cPrimary: Bucket? = nil, cSecondary: Bucket? = nil, cPlan: String? = nil
+            var cInstalled = false
+            if self.codexEnabled {
+                codexRecs = self.codexParser.parseAll()
+                cPrimary = self.codexParser.latestPrimary
+                cSecondary = self.codexParser.latestSecondary
+                cPlan = self.codexParser.latestPlan
+                cInstalled = self.codexParser.isInstalled
+                debugLog("codex: installed=\(cInstalled), records=\(codexRecs.count), 5h=\(cPrimary?.utilization ?? -1)%, 7d=\(cSecondary?.utilization ?? -1)%")
+            }
+
             DispatchQueue.main.async {
                 self.allRecords = records; self.currentAccount = account
+                self.codexRecords = codexRecs
+                self.codexPrimary = cPrimary; self.codexSecondary = cSecondary
+                self.codexPlan = cPlan; self.codexInstalled = cInstalled
                 if let live {
                     self.liveUsage = live
                     self.apiFailCount = 0
@@ -948,6 +1286,35 @@ final class StatusBarController {
     private func rebuildMenu() {
         let menu = NSMenu()
         let now = Date()
+        updateTitle()
+        menu.appearance = NSAppearance(named: isDarkMenu ? .darkAqua : .aqua)
+
+        let hasCodex = codexInstalled && codexEnabled
+        // Hide the Claude block only for a Codex-only user (logged out + no Claude logs).
+        let showClaude = currentAccount != nil || !allRecords.isEmpty || !hasCodex
+        if showClaude { buildClaudeSections(menu, now: now) }
+        if hasCodex { buildCodexSections(menu, now: now) }
+
+        // ── Actions ────────────────────────────────────────────────────────────
+        let sw = NSMenuItem(title: "Switch Account", action: #selector(switchAccount), keyEquivalent: "")
+        sw.target = self; menu.addItem(sw)
+
+        let dm = NSMenuItem(title: isDarkMenu ? "Dark Mode" : "Light Mode",
+                            action: #selector(toggleTheme), keyEquivalent: "")
+        dm.target = self; dm.state = .on; menu.addItem(dm)
+
+        let se = NSMenuItem(title: "Settings\u{2026}", action: #selector(openSettings), keyEquivalent: ",")
+        se.target = self; menu.addItem(se)
+        let re = NSMenuItem(title: "Refresh", action: #selector(refreshAction), keyEquivalent: "r")
+        re.target = self; menu.addItem(re)
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate), keyEquivalent: "q"))
+        statusItem.menu = menu
+    }
+
+    // MARK: - Provider sections
+
+    private func buildClaudeSections(_ menu: NSMenu, now: Date) {
         let todayRecs = parser.records(for: now, from: allRecords)
         let todayCost = todayRecs.reduce(0.0) { $0 + $1.cost }
         let todayInFresh = todayRecs.reduce(0) { $0 + $1.usage.inputTokens }
@@ -957,9 +1324,6 @@ final class StatusBarController {
         // Total ↓ includes all input-side tokens (fresh + cache read + cache write)
         // so the breakdown caption underneath sums to the displayed total.
         let todayIn      = todayInFresh + todayCacheR + todayCacheW
-
-        updateTitle()
-        menu.appearance = NSAppearance(named: isDarkMenu ? .darkAqua : .aqua)
 
         // ── Account ──────────────────────────────────────────────────────────
         if let a = currentAccount {
@@ -981,12 +1345,12 @@ final class StatusBarController {
         menu.addItem(.separator())
 
         // ── Usage Windows ─────────────────────────────────────────────────────
-        windowRow(menu, label: "Session (5h)",   secs: 5*3600,    bucket: liveUsage?.fiveHour,       fallbackResetAt: nil, now: now)
-        windowRow(menu, label: "Weekly (7d)",    secs: 7*24*3600, bucket: liveUsage?.sevenDay,        fallbackResetAt: nil, now: now)
+        windowRow(menu, label: "Session (5h)",   secs: 5*3600,    bucket: liveUsage?.fiveHour,       fallbackResetAt: nil, now: now, records: allRecords)
+        windowRow(menu, label: "Weekly (7d)",    secs: 7*24*3600, bucket: liveUsage?.sevenDay,        fallbackResetAt: nil, now: now, records: allRecords)
         if let sonnet = liveUsage?.sevenDaySonnet {
             // Use sevenDay reset time as fallback when sonnet has no activity (resets_at: null)
             let fallback = liveUsage?.sevenDay?.resetsAt
-            windowRow(menu, label: "Sonnet (7d)", secs: 7*24*3600, bucket: sonnet, fallbackResetAt: fallback, now: now)
+            windowRow(menu, label: "Sonnet (7d)", secs: 7*24*3600, bucket: sonnet, fallbackResetAt: fallback, now: now, records: allRecords)
         }
         menu.addItem(.separator())
 
@@ -998,10 +1362,53 @@ final class StatusBarController {
         menu.addItem(.separator())
 
         // ── Recent Sessions (submenu) ─────────────────────────────────────────
+        menu.addItem(recentSessionsItem(sessions: parser.recentSessions(from: allRecords, count: 10)))
+        menu.addItem(.separator())
+    }
+
+    private func buildCodexSections(_ menu: NSMenu, now: Date) {
+        let todayRecs = codexParser.records(for: now, from: codexRecords)
+        let inFresh = todayRecs.reduce(0) { $0 + $1.usage.inputTokens }
+        let cacheR  = todayRecs.reduce(0) { $0 + $1.usage.cacheReadTokens }
+        let out     = todayRecs.reduce(0) { $0 + $1.usage.outputTokens }
+        let cost    = todayRecs.reduce(0.0) { $0 + $1.cost }
+        let inTotal = inFresh + cacheR
+
+        // ── Header ────────────────────────────────────────────────────────────
+        let planLabel = codexPlan.map { "  \u{00B7}  \($0.capitalized)" } ?? ""
+        addHeader(menu, "\u{25CF}  Codex\(planLabel)")
+        addCaption(menu, "This Mac only  \u{00B7}  Local session logs")
+        menu.addItem(.separator())
+
+        // ── Today ─────────────────────────────────────────────────────────────
+        let df = DateFormatter(); df.dateFormat = "EEEE, d MMM"
+        addHeader(menu, "Today  \u{00B7}  \(df.string(from: now))")
+        addMono(menu, "\u{2193} \(CostCalculator.formatTokens(inTotal))  \u{2191} \(CostCalculator.formatTokens(out))   \u{2022}   \(CostCalculator.formatCost(cost))")
+        // Codex has no cache-write concept; only fresh vs cached input.
+        addCaption(menu, "in: \(CostCalculator.formatTokens(inFresh)) fresh  \u{00B7}  \(CostCalculator.formatTokens(cacheR)) cache↺")
+        menu.addItem(.separator())
+
+        // ── Usage Windows ─────────────────────────────────────────────────────
+        windowRow(menu, label: "Session (5h)", secs: 5*3600,    bucket: codexPrimary,   fallbackResetAt: nil, now: now, records: codexRecords)
+        windowRow(menu, label: "Weekly (7d)",  secs: 7*24*3600, bucket: codexSecondary, fallbackResetAt: nil, now: now, records: codexRecords)
+        if codexPrimary == nil && codexSecondary == nil {
+            // rate_limits absent (e.g. only `codex exec` used, or older build) — windows estimated.
+            addCaption(menu, "Live limits unavailable \u{00B7} estimated from logs")
+        }
+        menu.addItem(.separator())
+
+        // ── Recent Sessions (submenu) ─────────────────────────────────────────
+        menu.addItem(recentSessionsItem(sessions: codexParser.recentSessions(from: codexRecords, count: 10)))
+        menu.addItem(.separator())
+    }
+
+    /// Builds the shared "Recent Sessions" submenu item from aggregated session rows.
+    private func recentSessionsItem(
+        sessions: [(sessionId: String, lastTimestamp: Date, cost: Double, projectName: String)]
+    ) -> NSMenuItem {
         let sessionsItem = NSMenuItem(title: "Recent Sessions", action: nil, keyEquivalent: "")
         let submenu = NSMenu(title: "Recent Sessions")
         submenu.appearance = NSAppearance(named: isDarkMenu ? .darkAqua : .aqua)
-        let sessions = parser.recentSessions(from: allRecords, count: 10)
         if sessions.isEmpty {
             let empty = NSMenuItem(title: "No sessions found", action: nil, keyEquivalent: "")
             empty.isEnabled = false; submenu.addItem(empty)
@@ -1020,32 +1427,16 @@ final class StatusBarController {
             }
         }
         sessionsItem.submenu = submenu
-        menu.addItem(sessionsItem)
-        menu.addItem(.separator())
-
-        // ── Actions ────────────────────────────────────────────────────────────
-        let sw = NSMenuItem(title: "Switch Account", action: #selector(switchAccount), keyEquivalent: "")
-        sw.target = self; menu.addItem(sw)
-
-        let dm = NSMenuItem(title: isDarkMenu ? "Dark Mode" : "Light Mode",
-                            action: #selector(toggleTheme), keyEquivalent: "")
-        dm.target = self; dm.state = .on; menu.addItem(dm)
-
-        let se = NSMenuItem(title: "Settings\u{2026}", action: #selector(openSettings), keyEquivalent: ",")
-        se.target = self; menu.addItem(se)
-        let re = NSMenuItem(title: "Refresh", action: #selector(refreshAction), keyEquivalent: "r")
-        re.target = self; menu.addItem(re)
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate), keyEquivalent: "q"))
-        statusItem.menu = menu
+        return sessionsItem
     }
 
     // MARK: - Window row (compact two-line)
 
     private func windowRow(_ menu: NSMenu, label: String, secs: TimeInterval,
-                            bucket: UsageAPIClient.Bucket?, fallbackResetAt: Date?, now: Date)
+                            bucket: Bucket?, fallbackResetAt: Date?, now: Date,
+                            records: [UsageRecord])
     {
-        let wRecs = allRecords.filter { $0.timestamp >= now.addingTimeInterval(-secs) }
+        let wRecs = records.filter { $0.timestamp >= now.addingTimeInterval(-secs) }
         let tokens = wRecs.reduce(0) {
             $0 + $1.usage.inputTokens + $1.usage.outputTokens
                 + $1.usage.cacheCreationTokens + $1.usage.cacheReadTokens
@@ -1175,8 +1566,8 @@ final class StatusBarController {
         )
     }
 
-    private func makePillImage(pct: Double, text: String) -> NSImage {
-        let width: CGFloat = 46, height: CGFloat = 16
+    private func makePillImage(pct: Double, text: String, width: CGFloat = 46) -> NSImage {
+        let height: CGFloat = 16
         let img = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
             let r = rect.insetBy(dx: 0.75, dy: 0.75)
             let corner = r.height / 2
@@ -1210,7 +1601,7 @@ final class StatusBarController {
         return img
     }
 
-    private func makeContainerImage(fh: UsageAPIClient.Bucket, sd: UsageAPIClient.Bucket, now: Date) -> NSImage {
+    private func makeContainerImage(fh: Bucket, sd: Bucket, now: Date) -> NSImage {
         let fhT = fh.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--"
         let sdT = sd.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--"
 
@@ -1269,18 +1660,121 @@ final class StatusBarController {
         return img
     }
 
+    /// Live 5h/7d buckets for a provider, if both are available for the menu bar.
+    private func menubarBuckets(_ p: Provider) -> (Bucket, Bucket)? {
+        switch p {
+        case .claude:
+            guard let fh = liveUsage?.fiveHour, let sd = liveUsage?.sevenDay else { return nil }
+            return (fh, sd)
+        case .codex:
+            guard let fh = codexPrimary, let sd = codexSecondary else { return nil }
+            return (fh, sd)
+        }
+    }
+
+    /// Compact combined menu-bar image for ≥2 providers in ONE dark container:
+    /// per provider `<tag> [5h%][7d%] <5h-reset>`, separated by a dim dot. Keeps both
+    /// windows + the session "time left" at a glance without doubling the width.
+    private func makeCombinedImage(_ entries: [(tag: String, fh: Bucket, sd: Bucket)], now: Date) -> NSImage {
+        let pillW: CGFloat = 40, pillH: CGFloat = 16, height: CGFloat = 22
+        let padX: CGFloat = 9, gTag: CGFloat = 4, gPill: CGFloat = 3, gReset: CGFloat = 5, gSep: CGFloat = 7
+
+        let tagAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.70)]
+        let dimAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.55)]
+
+        struct Cell { let tag: NSAttributedString; let pill5: NSImage; let pill7: NSImage; let reset: NSAttributedString }
+        let cells: [Cell] = entries.map { e in
+            Cell(tag: NSAttributedString(string: e.tag, attributes: tagAttrs),
+                 pill5: makePillImage(pct: e.fh.utilization, text: "\(Int(e.fh.utilization))%", width: pillW),
+                 pill7: makePillImage(pct: e.sd.utilization, text: "\(Int(e.sd.utilization))%", width: pillW),
+                 reset: NSAttributedString(string: e.fh.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--",
+                                           attributes: dimAttrs))
+        }
+        let sepAS = NSAttributedString(string: "·", attributes: dimAttrs)
+
+        var contentW: CGFloat = 0
+        for (i, c) in cells.enumerated() {
+            contentW += c.tag.size().width + gTag + pillW + gPill + pillW + gReset + c.reset.size().width
+            if i < cells.count - 1 { contentW += gSep + sepAS.size().width + gSep }
+        }
+        let totalW = padX * 2 + contentW
+
+        let img = NSImage(size: NSSize(width: totalW, height: height), flipped: false) { rect in
+            let bg = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 11, yRadius: 11)
+            NSColor(calibratedWhite: 0.08, alpha: 0.82).setFill(); bg.fill()
+            NSColor.white.withAlphaComponent(0.14).setStroke(); bg.lineWidth = 0.75; bg.stroke()
+
+            let cy = height / 2
+            var x = padX
+            func drawText(_ s: NSAttributedString, gapAfter: CGFloat) {
+                let sz = s.size()
+                s.draw(at: NSPoint(x: x, y: cy - sz.height / 2 + 0.5))
+                x += sz.width + gapAfter
+            }
+            func drawPill(_ p: NSImage, gapAfter: CGFloat) {
+                p.draw(in: NSRect(x: x, y: cy - pillH / 2, width: pillW, height: pillH))
+                x += pillW + gapAfter
+            }
+            for (i, c) in cells.enumerated() {
+                drawText(c.tag, gapAfter: gTag)
+                drawPill(c.pill5, gapAfter: gPill)
+                drawPill(c.pill7, gapAfter: gReset)
+                drawText(c.reset, gapAfter: i < cells.count - 1 ? gSep : 0)
+                if i < cells.count - 1 { drawText(sepAS, gapAfter: gSep) }
+            }
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }
+
     private func updateTitle() {
         guard let btn = statusItem.button else { return }
-        if !isLoading, let fh = liveUsage?.fiveHour, let sd = liveUsage?.sevenDay {
-            btn.image = makeContainerImage(fh: fh, sd: sd, now: Date())
+        let now = Date()
+
+        // Which providers does the user want in the menu bar, and which have live data?
+        var requested: [Provider]
+        switch menubarSource {
+        case .claude: requested = [.claude]
+        case .codex:  requested = [.codex]
+        case .both:   requested = [.claude, .codex]
+        }
+        // Codex can't be shown while tracking is off; never end up requesting nothing.
+        if !codexEnabled { requested.removeAll { $0 == .codex } }
+        if requested.isEmpty { requested = [.claude] }
+        let available = isLoading ? [] : requested.filter { menubarBuckets($0) != nil }
+
+        if available.count >= 2 {
+            // Both providers: one compact combined container.
+            let entries = available.compactMap { p -> (tag: String, fh: Bucket, sd: Bucket)? in
+                guard let (fh, sd) = menubarBuckets(p) else { return nil }
+                return (p.menubarTag, fh, sd)
+            }
+            btn.image = makeCombinedImage(entries, now: now)
+            btn.imageScaling = .scaleNone
+            btn.imagePosition = .imageOnly
+            btn.title = ""
+        } else if let p = available.first, let (fh, sd) = menubarBuckets(p) {
+            // Single provider: full layout with both reset times.
+            btn.image = makeContainerImage(fh: fh, sd: sd, now: now)
             btn.imageScaling = .scaleNone
             btn.imagePosition = .imageOnly
             btn.title = ""
         } else {
             btn.image = nil
             btn.imagePosition = .noImage
-            let text = isLoading ? "$--.--" : CostCalculator.formatCost(
-                parser.records(for: Date(), from: allRecords).reduce(0.0) { $0 + $1.cost })
+            // Text fallback: today's cost summed over the requested provider(s).
+            let cost = requested.reduce(0.0) { acc, p in
+                switch p {
+                case .claude: return acc + parser.records(for: now, from: allRecords).reduce(0.0) { $0 + $1.cost }
+                case .codex:  return acc + codexParser.records(for: now, from: codexRecords).reduce(0.0) { $0 + $1.cost }
+                }
+            }
+            let text = isLoading ? "$--.--" : CostCalculator.formatCost(cost)
             btn.attributedTitle = NSAttributedString(string: text, attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)])
         }
@@ -1350,6 +1844,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 // MARK: - Entry Point
+
+// Headless diagnostic: `ClaudeUsage --codex-dump` parses the Codex logs (honoring
+// CODEX_HOME) and prints a summary, then exits without launching the menu bar.
+if CommandLine.arguments.contains("--codex-dump") {
+    let p = CodexLogParser()
+    let recs = p.parseAll()
+    let now = Date()
+    let today = UsageMath.records(for: now, from: recs)
+    func sum(_ rs: [UsageRecord], _ kp: (TokenUsage) -> Int) -> Int { rs.reduce(0) { $0 + kp($1.usage) } }
+    let f = ISO8601DateFormatter()
+    print("installed: \(p.isInstalled)")
+    print("records: \(recs.count)")
+    print("today.fresh: \(sum(today, { $0.inputTokens }))")
+    print("today.cacheRead: \(sum(today, { $0.cacheReadTokens }))")
+    print("today.output: \(sum(today, { $0.outputTokens }))")
+    print("today.cost: \(String(format: "%.5f", today.reduce(0.0) { $0 + $1.cost }))")
+    print("plan: \(p.latestPlan ?? "nil")")
+    print("primary: \(p.latestPrimary.map { "\($0.utilization)% resets=\($0.resetsAt.map { f.string(from: $0) } ?? "nil")" } ?? "nil")")
+    print("secondary: \(p.latestSecondary.map { "\($0.utilization)% resets=\($0.resetsAt.map { f.string(from: $0) } ?? "nil")" } ?? "nil")")
+    for s in p.recentSessions(from: recs, count: 5) {
+        print("session: \(s.projectName) | \(f.string(from: s.lastTimestamp)) | $\(String(format: "%.5f", s.cost))")
+    }
+    exit(0)
+}
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
