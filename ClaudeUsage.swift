@@ -342,6 +342,32 @@ final class CodexLogParser {
 
     var isInstalled: Bool { FileManager.default.fileExists(atPath: sessionsURL.path) }
 
+    /// Reads the logged-in OpenAI account from `<base>/auth.json` by decoding the
+    /// `id_token` JWT payload (no signature check — local file, display only).
+    /// Lets the user confirm Codex data comes from the expected account.
+    func account() -> (email: String?, plan: String?) {
+        let authURL = baseURL.appendingPathComponent("auth.json")
+        guard let data = try? Data(contentsOf: authURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = json["tokens"] as? [String: Any],
+              let idToken = tokens["id_token"] as? String else { return (nil, nil) }
+        let parts = idToken.split(separator: ".")
+        guard parts.count >= 2,
+              let payloadData = Self.base64urlDecode(String(parts[1])),
+              let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
+        else { return (nil, nil) }
+        let email = payload["email"] as? String
+        let auth = payload["https://api.openai.com/auth"] as? [String: Any]
+        let plan = auth?["chatgpt_plan_type"] as? String
+        return (email, plan)
+    }
+
+    private static func base64urlDecode(_ s: String) -> Data? {
+        var str = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while str.count % 4 != 0 { str += "=" }
+        return Data(base64Encoded: str)
+    }
+
     // Date-sharded dirs (YYYY/MM/DD) for the last `days` days, across sessions + archived.
     private func recentDateDirs(days: Int, now: Date) -> [URL] {
         let cal = Calendar.current
@@ -1173,6 +1199,7 @@ final class StatusBarController {
     private var codexPrimary: Bucket?
     private var codexSecondary: Bucket?
     private var codexPlan: String?
+    private var codexEmail: String?
     private var codexInstalled = false
 
     private var isDarkMenu: Bool {
@@ -1247,6 +1274,7 @@ final class StatusBarController {
             // latest non-null rate_limits snapshot in the session logs.
             var codexRecs: [UsageRecord] = []
             var cPrimary: Bucket? = nil, cSecondary: Bucket? = nil, cPlan: String? = nil
+            var cEmail: String? = nil
             var cInstalled = false
             if self.codexEnabled {
                 codexRecs = self.codexParser.parseAll()
@@ -1254,14 +1282,18 @@ final class StatusBarController {
                 cSecondary = self.codexParser.latestSecondary
                 cPlan = self.codexParser.latestPlan
                 cInstalled = self.codexParser.isInstalled
-                debugLog("codex: installed=\(cInstalled), records=\(codexRecs.count), 5h=\(cPrimary?.utilization ?? -1)%, 7d=\(cSecondary?.utilization ?? -1)%")
+                // Account (email + plan) from ~/.codex/auth.json; auth plan is authoritative.
+                let acct = self.codexParser.account()
+                cEmail = acct.email
+                if let p = acct.plan { cPlan = p }
+                debugLog("codex: installed=\(cInstalled), email=\(cEmail ?? "nil"), records=\(codexRecs.count), 5h=\(cPrimary?.utilization ?? -1)%, 7d=\(cSecondary?.utilization ?? -1)%")
             }
 
             DispatchQueue.main.async {
                 self.allRecords = records; self.currentAccount = account
                 self.codexRecords = codexRecs
                 self.codexPrimary = cPrimary; self.codexSecondary = cSecondary
-                self.codexPlan = cPlan; self.codexInstalled = cInstalled
+                self.codexPlan = cPlan; self.codexEmail = cEmail; self.codexInstalled = cInstalled
                 if let live {
                     self.liveUsage = live
                     self.apiFailCount = 0
@@ -1375,8 +1407,9 @@ final class StatusBarController {
         let inTotal = inFresh + cacheR
 
         // ── Header ────────────────────────────────────────────────────────────
+        let acctLabel = codexEmail.map { "  \u{00B7}  \($0)" } ?? ""
         let planLabel = codexPlan.map { "  \u{00B7}  \($0.capitalized)" } ?? ""
-        addHeader(menu, "\u{25CF}  Codex\(planLabel)")
+        addHeader(menu, "\u{25CF}  Codex\(acctLabel)\(planLabel)")
         addCaption(menu, "This Mac only  \u{00B7}  Local session logs")
         menu.addItem(.separator())
 
@@ -1443,24 +1476,26 @@ final class StatusBarController {
         }
         let cost = wRecs.reduce(0.0) { $0 + $1.cost }
 
-        let pct: Double; let resetStr: String
+        let pct: Double; let resetStr: String; let stale: Bool
         if let b = bucket {
-            pct = b.utilization
             let resetDate = b.resetsAt ?? fallbackResetAt
-            if let rd = resetDate {
-                let rem = rd.timeIntervalSince(now)
-                resetStr = rem > 0 ? fmtReset(rd, now: now) : "resetting"
-            } else { resetStr = "--" }
+            if let rd = resetDate, rd.timeIntervalSince(now) <= 0 {
+                // Snapshot stale: this window already rolled over since it was captured.
+                stale = true; pct = 0; resetStr = "reset"
+            } else {
+                stale = false; pct = b.utilization
+                resetStr = resetDate.map { fmtReset($0, now: now) } ?? "--"
+            }
         } else {
-            pct = 0
+            stale = false; pct = 0
             if let first = wRecs.first {
                 let rem = first.timestamp.addingTimeInterval(secs).timeIntervalSince(now)
                 resetStr = rem > 0 ? "~\(fmtDuration(rem))" : "reset"
             } else { resetStr = "reset" }
         }
 
-        let isLive = bucket != nil
-        let pctStr = isLive ? String(format: "%.0f%%", pct) : "--"
+        let isLive = bucket != nil && !stale
+        let pctStr = stale ? "\u{2014}" : (isLive ? String(format: "%.0f%%", pct) : "--")
         let bar    = progressBar(pct)
         // Compact: label + pct + reset on line 1; bar + tokens on line 2
         let line1 = "\(label)   \(pctStr)   \(resetStr)"
@@ -1601,9 +1636,25 @@ final class StatusBarController {
         return img
     }
 
+    /// Pill for a window; a stale snapshot (reset already passed → window rolled over)
+    /// renders as an empty "—" pill instead of a misleading old percentage.
+    private func windowPill(_ b: Bucket, now: Date, width: CGFloat = 46) -> NSImage {
+        if let r = b.resetsAt, r <= now {
+            return makePillImage(pct: 0, text: "\u{2014}", width: width)
+        }
+        return makePillImage(pct: b.utilization, text: "\(Int(b.utilization))%", width: width)
+    }
+
+    /// Reset label: time-to-reset, or "reset" when the window has already rolled over.
+    private func resetLabel(_ b: Bucket, now: Date) -> String {
+        guard let r = b.resetsAt else { return "--" }
+        let rem = r.timeIntervalSince(now)
+        return rem > 0 ? compactTime(rem) : "reset"
+    }
+
     private func makeContainerImage(fh: Bucket, sd: Bucket, now: Date) -> NSImage {
-        let fhT = fh.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--"
-        let sdT = sd.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--"
+        let fhT = resetLabel(fh, now: now)
+        let sdT = resetLabel(sd, now: now)
 
         let textAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
@@ -1626,8 +1677,8 @@ final class StatusBarController {
         let totalW = padX * 2 + contentW
 
         // Pre-render pills before entering drawing block
-        let pill1 = makePillImage(pct: fh.utilization, text: "\(Int(fh.utilization))%")
-        let pill2 = makePillImage(pct: sd.utilization, text: "\(Int(sd.utilization))%")
+        let pill1 = windowPill(fh, now: now)
+        let pill2 = windowPill(sd, now: now)
 
         let img = NSImage(size: NSSize(width: totalW, height: height), flipped: false) { rect in
             // Dark rounded container background
@@ -1689,10 +1740,9 @@ final class StatusBarController {
         struct Cell { let tag: NSAttributedString; let pill5: NSImage; let pill7: NSImage; let reset: NSAttributedString }
         let cells: [Cell] = entries.map { e in
             Cell(tag: NSAttributedString(string: e.tag, attributes: tagAttrs),
-                 pill5: makePillImage(pct: e.fh.utilization, text: "\(Int(e.fh.utilization))%", width: pillW),
-                 pill7: makePillImage(pct: e.sd.utilization, text: "\(Int(e.sd.utilization))%", width: pillW),
-                 reset: NSAttributedString(string: e.fh.resetsAt.map { compactTime($0.timeIntervalSince(now)) } ?? "--",
-                                           attributes: dimAttrs))
+                 pill5: windowPill(e.fh, now: now, width: pillW),
+                 pill7: windowPill(e.sd, now: now, width: pillW),
+                 reset: NSAttributedString(string: resetLabel(e.fh, now: now), attributes: dimAttrs))
         }
         let sepAS = NSAttributedString(string: "·", attributes: dimAttrs)
 
@@ -1854,7 +1904,10 @@ if CommandLine.arguments.contains("--codex-dump") {
     let today = UsageMath.records(for: now, from: recs)
     func sum(_ rs: [UsageRecord], _ kp: (TokenUsage) -> Int) -> Int { rs.reduce(0) { $0 + kp($1.usage) } }
     let f = ISO8601DateFormatter()
+    let acct = p.account()
     print("installed: \(p.isInstalled)")
+    print("account.email: \(acct.email ?? "nil")")
+    print("account.plan: \(acct.plan ?? "nil")")
     print("records: \(recs.count)")
     print("today.fresh: \(sum(today, { $0.inputTokens }))")
     print("today.cacheRead: \(sum(today, { $0.cacheReadTokens }))")
