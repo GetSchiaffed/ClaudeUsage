@@ -1652,6 +1652,15 @@ final class StatusBarController {
         return rem > 0 ? compactTime(rem) : "reset"
     }
 
+    /// Single countdown for the compact combined menu bar: the 5h window while it's
+    /// live, otherwise fall back to the weekly window (e.g. Codex idle for >5h shows
+    /// the weekly reset timer instead of a bare "reset").
+    private func combinedResetLabel(fh: Bucket, sd: Bucket, now: Date) -> String {
+        if let r = fh.resetsAt, r.timeIntervalSince(now) > 0 { return compactTime(r.timeIntervalSince(now)) }
+        if let r = sd.resetsAt, r.timeIntervalSince(now) > 0 { return compactTime(r.timeIntervalSince(now)) }
+        return "reset"
+    }
+
     private func makeContainerImage(fh: Bucket, sd: Bucket, now: Date) -> NSImage {
         let fhT = resetLabel(fh, now: now)
         let sdT = resetLabel(sd, now: now)
@@ -1742,7 +1751,7 @@ final class StatusBarController {
             Cell(tag: NSAttributedString(string: e.tag, attributes: tagAttrs),
                  pill5: windowPill(e.fh, now: now, width: pillW),
                  pill7: windowPill(e.sd, now: now, width: pillW),
-                 reset: NSAttributedString(string: resetLabel(e.fh, now: now), attributes: dimAttrs))
+                 reset: NSAttributedString(string: combinedResetLabel(fh: e.fh, sd: e.sd, now: now), attributes: dimAttrs))
         }
         let sepAS = NSAttributedString(string: "·", attributes: dimAttrs)
 
